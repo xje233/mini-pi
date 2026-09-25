@@ -1,0 +1,22 @@
+{
+	"name": "mini-pi",
+	"version": "0.1.0",
+	"private": true,
+	"description": "从 0 手写的 agent harness，对照 pi 源码学习",
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"start": "tsx src/main.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@sinclair/typebox": "^0.34.33"
+	},
+	"devDependencies": {
+		"@types/node": "^22.15.0",
+		"tsx": "^4.19.0",
+		"typescript": "^5.8.0"
+	}
+}
