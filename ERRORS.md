@@ -88,3 +88,129 @@ Promise 直接 reject，错误消息为 `readline was closed`，被顶层 catch 
 
 ---
 
+## ERR-003 | 2026-09-26 | readline/promises 连续 question 丢行 + EOF 挂起不 settle
+
+**现象**
+
+管道喂入多行命令时，只有第一行被处理；其余行不投递，进程一直等到
+stdin 关闭才以 exit 0 结束。另一变体：挂起中的 question 在 EOF 时 Promise
+永不 settle，Node 报 `Detected unsettled top-level await` 后直接退出。
+
+**具体内容**
+
+`rl.question()` 连续调用 + 管道输入 `a\nb\nc\nexit\n`：第一次拿到 `a`，
+第二次要等到 EOF 才返回。用最小复现脚本验证，去掉 `Promise.race` 的
+对照版本行为完全一致——排除我们自身逻辑，是 Node 22.23 的
+`readline/promises` 行为：**question() 第一次 resolve 后，缓冲区中剩余的行
+不会投递给后续的 question 调用**。
+
+**错误原因**
+
+- `question()` 是为"一次一问"的交互设计的，不是通用的逐行读取 API；
+  它内部与 prompt 机制耦合，连续调用时对已缓冲数据的投递不可靠。
+- 教训：**选型时要区分"交互一次"和"流式逐行"两种需求**，前者用
+  question，后者必须用 `line` 事件。
+
+**怎么解决**
+
+`main.ts` 用 `line` 事件自建 `LineQueue`（缓冲队列 + 单一 waiter +
+close 置 done），pull 语义与 agentLoop 的 `getUserMessage` 对齐；
+prompt 改为 `process.stdout.write`（仅 TTY 时显示）。
+最小复现验证：4 行全部按序投递、EOF 干净退出。
+
+**延伸 / 面试考点**
+
+1. **Promise API vs 事件 API**：Promise 表达"一次等待"，事件表达"持续到达"。
+   把持续到达的数据塞进一次性 Promise（question）是范畴错误；
+   正确模式是"事件 → 队列 → 异步迭代器/pull 接口"。
+2. **缓冲与背压**：readline 内部已有行缓冲，自建队列要处理
+   "数据先到、等待后到"（进缓冲）与"等待先到、数据后到"（直接唤醒）
+   两种时序——本质是单生产者/单消费者队列。
+3. **最小复现的价值**：先用 10 行脚本证明是平台行为而非业务 bug，
+   再决定绕过方案；排查时"去掉可疑层做对照"（本次去掉 race）能快速定位。
+4. **对照 pi**：`packages/tui` 的编辑器完全自建输入处理，
+   不依赖 readline/promises 的高层封装——工业级 CLI 都会自己管终端原始输入。
+
+---
+
+## ERR-004 | 2026-09-27 | 无校验的参数边界：String(undefined) / [object Object]（主动踩坑实验）
+
+**现象（实验复现，非线上事故）**
+
+| 实验 | 输入 | 实际结果 |
+|---|---|---|
+| write_file 漏传 path | `{ content: "hello" }` | **在当前工作目录真的创建了名为 `undefined` 的文件** |
+| content 传对象 | `{ path: "...", content: {nested:true} }` | 文件内容变成字面量 `[object Object]`，静默成功 |
+| path 传数字 | `{ path: 12345 }` | `String(12345)` → 去打开名为 `12345` 的路径 |
+| arguments 为空串/坏 JSON | `JSON.parse("")` | 抛 `Unexpected end of JSON input`（被 isError 回填兜住） |
+| read_file 读二进制 | `/usr/bin/ls` | ELF 乱码直接进入对话上下文 |
+
+**错误原因**
+
+- `String(x)` 对任何输入都"成功"，把类型错误变成了**静默的荒谬行为**：
+  `undefined` 变成字面量路径、对象变成 `[object Object]`。没有校验层时，
+  这些垃圾参数直达文件系统，最坏情况（本次实验）是在真实目录里创建垃圾文件。
+- `JSON.parse` 失败虽然被错误回填兜住（模型能自救），但每次都是一轮浪费的往返。
+- 读二进制文件没有嗅探/拒绝，浪费上下文且可能让模型困惑。
+
+**怎么解决（2026-09-28 已修复，见 DEVLOG F4）**
+
+1. ✅ 工具参数用 typebox schema 校验（对照 pi：`validateToolArguments`，
+   在执行前拦截并生成 isError 结果，不再直达文件系统）。
+2. ✅ 拒绝静默强转：类型不匹配走 `Value.Convert` 显式强转（"123"→123），
+   无法转换的在校验层拦截，`String(x)` 式静默转换不再可达 execute。
+3. JSON.parse 失败仍由 isError 回填兜底（受约束解码保护，实际极少发生）。
+
+**延伸 / 面试考点**
+
+1. **静默强转 vs 快速失败**：`String(undefined)` 能跑通 == 最危险的 bug 类型。
+   边界层（工具参数）宁可抛错也不将就。
+2. **错误成本不对称**：校验失败的成本是一次模型往返；校验缺失的成本是
+   破坏用户文件系统。agent 能动手之后，参数错误从"难看"升级成"危险"。
+3. **对照 pi**：`prepareToolCall`（agent-loop.ts:703）在执行前做
+   prepareArguments + validateToolArguments + beforeToolCall 钩子三道关，
+   我们跳过的每一道都对应上面一类事故。
+
+---
+
+## ERR-005 | 2026-09-27 | 模型方言：reasoner 的工具支持与被丢弃的 reasoning_content（主动踩坑实验）
+
+**现象**
+
+用同一份带 `tools` 的请求实测两个模型：
+- `deepseek-chat`：正常返回 tool_calls（`finish_reason: "tool_calls"`）。
+- `deepseek-reasoner`：**也支持 tools**（F2 踩坑预告里"reasoner 不支持
+  function calling"的历史结论在 2026-09 的 API 上已不成立），
+  但响应里多一个我们完全没处理的字段 `reasoning_content`
+  （模型完整的思考过程文本），mini-pi 静默丢弃。
+
+**错误原因**
+
+- 按模型能力写死假设（"reasoner 不支持工具"）而不实测——**模型能力是
+  时变的**，provider 一个版本就翻转。
+- 统一消息格式只映射了 `content`/`tool_calls`，对增量字段（如
+  `reasoning_content`）没有"未知字段保留"策略，信息无声丢失。
+
+**怎么解决**
+
+1. 模型能力不写死、要实测：接入新模型时用冒烟脚本验证 tools/长上下文/
+   多模态等关键能力（pi 的 `compat` 开关组就是这类实测结果的固化）。
+2. `toWire`/响应解析对未知字段宽容：至少把 `reasoning_content` 提取出来
+   作为 thinking 事件展示（pi 的流事件里专门有
+   `thinking_start/delta/end` 一族，packages/ai/src/types.ts:732）。
+3. 阶段 3 做 provider 层时，把"每家 API 独有的字段"列成显式清单。
+
+**延伸 / 面试考点**
+
+1. **兼容层的正确姿势**：内部统一格式是"超集"设计——各 API 的特有信息
+   （thinking、usage、cache 命中）都要有位置存放，转换时只增不减。
+2. **能力探测 vs 声明式配置**：运行时探测模型能力代价高且不稳定；
+   pi 把能力写成模型元数据（contextWindow、reasoning、compat），
+   目录数据化（F2 踩坑 5）的又一例证。
+3. **实验方法论**：两个模型跑同一个 prompt 对照输出——方言差异必须
+   双模型实测才能发现，看文档/猜都不可靠。
+
+---
+
+
+

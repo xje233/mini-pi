@@ -54,18 +54,28 @@ export function listModels(): string {
 
 /**
  * 解析 "provider/model" 或裸 "modelId"（对照 pi 的 model-resolver.ts：先全串、
- * 再按第一个 / 拆开匹配、最后裸 id 匹配，歧义时拒绝）。
+ * 再按第一个 / 拆开匹配、最后裸 id 匹配）。
+ * "未找到"与"有歧义"是两种不同的失败，显式区分而不是都返回 undefined。
  */
-export function resolveModel(pattern: string): ModelDef | undefined {
+export type ResolveResult =
+	| { ok: true; model: ModelDef }
+	| { ok: false; reason: "not_found" }
+	| { ok: false; reason: "ambiguous"; candidates: ModelDef[] };
+
+export function resolveModel(pattern: string): ResolveResult {
 	const p = pattern.trim();
 	const exact = MODELS.find((m) => `${m.provider}/${m.modelId}` === p);
-	if (exact) return exact;
+	if (exact) return { ok: true, model: exact };
 	if (p.includes("/")) {
 		const [provider, modelId] = p.split("/", 2);
-		return MODELS.find((m) => m.provider === provider && m.modelId === modelId);
+		const match = MODELS.find((m) => m.provider === provider && m.modelId === modelId);
+		return match ? { ok: true, model: match } : { ok: false, reason: "not_found" };
 	}
 	const matches = MODELS.filter((m) => m.modelId === p);
-	return matches.length === 1 ? matches[0] : undefined;
+	const [first] = matches;
+	if (matches.length === 1 && first) return { ok: true, model: first };
+	if (matches.length > 1) return { ok: false, reason: "ambiguous", candidates: matches };
+	return { ok: false, reason: "not_found" };
 }
 
 /** 取 provider 对应的 API Key；deepseek 兼容旧的 LLM_API_KEY */
