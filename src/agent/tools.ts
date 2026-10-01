@@ -10,10 +10,11 @@ import type { ToolSchema } from "../ai/index.js";
 
 const execAsync = promisify(exec);
 
-/** 对照 pi: packages/agent/src/types.ts 的 AgentTool（精简版：去掉钩子/signal/onUpdate） */
+/** 对照 pi: packages/agent/src/types.ts 的 AgentTool（精简版：去掉钩子/onUpdate） */
 export interface AgentTool extends ToolSchema {
 	label: string;
-	execute(args: Record<string, unknown>): Promise<string>;
+	/** signal：用户 abort 时工具应尽快终止（如 kill 子进程）并抛错 */
+	execute(args: Record<string, unknown>, signal?: AbortSignal): Promise<string>;
 }
 
 export const createTools = (): AgentTool[] => [
@@ -65,11 +66,13 @@ export const createTools = (): AgentTool[] => [
 		parameters: Type.Object({
 			command: Type.String({ description: "要执行的 shell 命令" }),
 		}),
-		execute: async (args) => {
+		execute: async (args, signal) => {
 			try {
+				// signal 传入 exec：用户 abort 时直接 kill 子进程（Node ≥16 支持）
 				const { stdout } = await execAsync(String(args.command), {
 					timeout: 30_000,
 					maxBuffer: 1024 * 1024,
+					signal,
 				});
 				return stdout || "(命令执行成功，无输出)";
 			} catch (err) {

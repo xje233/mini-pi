@@ -18,8 +18,16 @@ class LineQueue {
 	private waiter: ((line: string | null) => void) | null = null;
 	private done = false;
 
-	constructor(rl: readline.Interface) {
+	/**
+	 * onLine：每行的同步观察者，返回 true 表示该行已被消费（如 /stop 触发中止），
+	 * 不再进入队列。abort 必须在行到达时立即生效，不能等回合边界。
+	 */
+	constructor(
+		private rl: readline.Interface,
+		private onLine?: (line: string) => boolean,
+	) {
 		rl.on("line", (line) => {
+			if (this.onLine?.(line)) return;
 			if (this.waiter) {
 				const resolve = this.waiter;
 				this.waiter = null;
@@ -107,14 +115,30 @@ console.log(`可用模型:\n${listModels()}\n切换: /model <provider/model>，�
 const systemPrompt =
 	process.env.SYSTEM_PROMPT ??
 	"你是一个运行在用户终端里的 coding agent。用提供的工具完成用户的任务，完成后用一两句话简短总结。用简体中文。";
-const rl = readline.createInterface({ input: process.stdin, terminal: process.stdin.isTTY });
-const lines = new LineQueue(rl);
+// terminal 模式下回显/行编辑依赖 output 流——漏掉它会导致"输入不显示"（ERR-006）
+const rl = readline.createInterface({
+	input: process.stdin,
+	output: process.stdout,
+	terminal: process.stdin.isTTY,
+});
 
-console.log("提示：agent 执行期间可直接输入消息进行 steering（回合边界生效），输入 exit 在当前回合结束后退出");
+console.log("提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止当前任务；exit = 退出");
 
 // 用户在 agent 忙碌期间输入 exit → 本回合结束后退出（quitRequested 由会话层转换，
 // 循环层只认 getUserMessage 返回 null）
 let quitRequested = false;
+// 每个任务一个 AbortController（对齐 pi：activeRun.abortController）
+let abortController: AbortController | null = null;
+let busy = false;
+
+const lines = new LineQueue(rl, (line) => {
+	// /stop 在 agent 忙碌时立即中止当前任务（abort 是独立通道，不走消息队列）
+	if (busy && line.trim() === "/stop") {
+		abortController?.abort();
+		return true; // 已消费，不进入队列
+	}
+	return false;
+});
 
 try {
 	await agentLoop(
@@ -123,6 +147,8 @@ try {
 			streamFn: defaultStreamFn,
 			tools: createTools(),
 			state,
+			maxTurns: Number(process.env.MAX_TURNS ?? 30),
+			getSignal: () => abortController?.signal,
 			getUserMessage: async () => {
 				while (true) {
 					if (quitRequested) return null;
@@ -130,11 +156,14 @@ try {
 					const input = await lines.next();
 					if (input === null) return null; // EOF / 管道结束，正常退出
 					if (input.trim() === "exit") return null;
+					if (input.trim() === "/stop") continue; // 空闲时 /stop 无意义，忽略
 					// 命令在本层消费，不进入循环
 					if (input.startsWith("/model")) {
 						handleModelCommand(input.slice("/model".length).trim());
 						continue;
 					}
+					// 新任务开始：换新的取消信号
+					abortController = new AbortController();
 					return input;
 				}
 			},
@@ -152,6 +181,9 @@ try {
 		},
 		(event) => {
 			switch (event.type) {
+				case "turn_start":
+					busy = true;
+					break;
 				case "message_end":
 					console.log(`\n🤖 [${event.model.provider}/${event.model.modelId}] ${event.content}`);
 					break;
@@ -164,7 +196,16 @@ try {
 				case "steering_applied":
 					console.log(`  ↩️  [steering] ${event.content}`);
 					break;
+				case "limit_reached":
+					console.log(`\n⛔ 已达单任务最大工具轮次（${event.maxTurns}），进入强制收尾`);
+					break;
+				case "turn_end":
+					busy = false;
+					if (event.reason === "aborted") console.log(`\n⛔ 已中止当前任务`);
+					else if (event.reason === "max_turns") console.log(`\n⛔ 已达最大工具轮次，任务结束`);
+					break;
 				case "agent_end":
+					busy = false;
 					rl.close();
 					break;
 			}

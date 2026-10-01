@@ -50,6 +50,8 @@ export type StreamFn = (
 	messages: ChatMessage[],
 	model: ModelDef,
 	tools: ToolSchema[],
+	/** 取消信号：用户 abort 时取消进行中的 HTTP 请求（对齐 pi 的 signal 贯穿） */
+	signal?: AbortSignal,
 ) => Promise<AssistantReply>;
 
 // —— 调用边界：内部统一格式 → OpenAI wire format ——
@@ -79,7 +81,7 @@ function resolveEndpoint(base: string): string {
 	return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
 }
 
-export const defaultStreamFn: StreamFn = async (messages, model, tools) => {
+export const defaultStreamFn: StreamFn = async (messages, model, tools, signal) => {
 	const apiKey = resolveApiKey(model);
 	if (!apiKey) {
 		throw new Error(
@@ -103,11 +105,14 @@ export const defaultStreamFn: StreamFn = async (messages, model, tools) => {
 
 	// 请求超时：LLM 长响应可能很慢，但连接级挂死必须有上限（LLM_TIMEOUT_MS 可覆盖）
 	const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
+	// 合并两个取消源：超时 + 用户 abort（AbortSignal.any 任一触发即取消）
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
 	const res = await fetch(resolveEndpoint(model.baseUrl), {
 		method: "POST",
 		headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
 		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(timeoutMs),
+		signal: combinedSignal,
 	}).catch((err: unknown) => {
 		if (err instanceof Error && err.name === "TimeoutError") {
 			throw new Error(`LLM 请求超时（${timeoutMs}ms）：${model.provider} 无响应，可稍后重试或调大 LLM_TIMEOUT_MS`);

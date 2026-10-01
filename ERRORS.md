@@ -212,5 +212,48 @@ prompt 改为 `process.stdout.write`（仅 TTY 时显示）。
 
 ---
 
+## ERR-006 | 2026-10-01 | TTY 回显失效：readline 缺 output 流（用户实测发现）
+
+**现象**
+
+交互模式下用户敲键盘：字符不显示（无回显），观感上"无法输入"。
+但管道测试（`echo | npm start`）全部通过。
+
+**具体内容**
+
+ERR-003 修复时从 `readline/promises` 换到 `node:readline`，接口配置写成
+`createInterface({ input: process.stdin, terminal: process.stdin.isTTY })`——
+漏掉了 `output: process.stdout`。readline 在 terminal 模式下的回显与行编辑
+是往 output 流写入实现的，缺省时回显链路断裂。管道测试不经过该路径
+（isTTY=false，terminal 逻辑整体不激活），所以全绿是"假绿"。
+
+**错误原因**
+
+- 直接原因：readline 接口缺 output 流。
+- 根本原因：**测试环境与真实使用环境的 I/O 语义不同**——管道是
+  非终端路径，TTY 才是产品的真实路径；TERMIOS/raw mode/回显这些
+  只在终端里激活的逻辑完全处于测试盲区。
+
+**怎么解决**
+
+`createInterface({ input, output: process.stdout, terminal: process.stdin.isTTY })`。
+验证工具：`script -qec "cmd" /dev/null` 分配伪终端（pty），
+让管道输入也能覆盖终端路径。
+
+**延伸 / 面试考点**
+
+1. **"假绿"测试**：测试通过 ≠ 覆盖了真实路径。环境相关的代码分支
+   （TTY vs 管道、dev vs prod）必须有对应环境的测试手段。
+2. **readline 的回显原理**：terminal 模式 = readline 把 stdin 置 raw mode、
+   自己接管按键（行编辑/历史/回显），回显写到 output 流——input/output/
+   terminal 三个参数是一个整体，缺一不可。
+3. **伪终端测试工具**：`script -qec`（util-linux）、`pty.js`、CI 里的
+   `script -c` 包装，是测 CLI 交互的标准手段。
+4. **对照 pi**：pi 的 `packages/tui` 完全自建终端渲染层（差分渲染 +
+   原始按键处理），不依赖 readline 的 terminal 模式——规避了这一整类
+   配置敏感问题，代价是自己维护 TERM 转义、光标、宽字符等全部细节。
+
+---
+
 
 

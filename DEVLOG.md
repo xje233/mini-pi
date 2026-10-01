@@ -280,3 +280,43 @@ src/main.ts              # LineQueue.tryNext() 非阻塞取行；exit→quitRequ
 插入 steering → 回合边界注入 → 模型总结包含指定语句，exit 0）。
 
 ---
+
+## F7 · Abort 硬中断 + 迭代上限（2026-10-01）
+
+**做了什么**
+
+① `signal` 贯穿全链路：`getSignal()` 提供 AbortSignal → `StreamFn`（fetch
+取消，`AbortSignal.any` 合并超时与用户取消两个源）→ `tool.execute`
+（`run_command` 传入 exec 的 signal，abort 时 kill 子进程）。会话层 `/stop`
+触发，立即生效，不经过消息队列。② 单任务 LLM 回合数超 `maxTurns`（默认
+30，`MAX_TURNS` 可调）后强制收尾：注入系统提示给模型一次纯总结机会，
+若仍要工具则拒绝执行并结束。
+
+**关键设计决策（对照 pi）**
+
+1. **abort 与 steering 是两条独立通道**：steering 走消息队列在回合边界生效；
+   abort 走 AbortSignal 立即生效（pi：Esc → `Agent.abort()` →
+   `activeRun.abortController.abort()`，interactive-mode.ts:2966）。
+2. **硬中断也守协议**：被中止的工具回填 `isError: "Operation aborted"`
+   结果（pi 同款），tool_call 配对永不破坏。
+3. **abort ≠ 会话销毁**：`turn_end(aborted)` 后回到提示符，会话继续
+   （pi：abort 结束本次 run，不销毁 session）。
+4. **abort 优先于 steering**：中止后跳过 steering 轮询，排队消息不注入。
+5. **迭代上限的柔性设计**：超限时不是直接掐死，而是注入系统提示 + 给模型
+   一个纯总结回合（forceStop 标志）；若模型仍要工具才硬结束
+   （`turn_end(max_turns)`）。
+6. **abort 触发点在会话层行观察者**：LineQueue 的 onLine 回调在行到达时
+   同步判断 `/stop`（busy 时消费该行并 abort），保证即时性。
+
+**验证**：typecheck 通过；mock 两条用例（工具执行中 abort：execute 立即
+收到 abort 信号、回填 isError、turn_end(aborted)、会话存活；maxTurns=3
+失控模型：3 回正常执行 + limit_reached + 强制收尾回合 + turn_end(max_turns)）；
+真机端到端（`sleep 20` 第 4 秒 `/stop` → 子进程被杀 → 立即回提示符，exit 0）。
+
+**过程中暴露的锋利边缘**：mock 工具用 plain JSON object 当 parameters，
+`Value.Check` 内部直接抛错且信息难懂——已加固：校验器把 schema 非法转换
+为明确错误。教训：**接受"schema 是 typebox"这一隐含契约的地方要有显式
+防呆**（pi 对非 typebox schema 有独立的 JSON Schema 强转路径，
+validation.ts:323）。
+
+---

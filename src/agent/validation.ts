@@ -38,9 +38,18 @@ export function validateToolArguments(tool: AgentTool, args: unknown): Validatio
 		// Convert 对极端输入可能抛错，交给下面的 Check 给出准确报错
 	}
 
-	// 严格层：typebox schema 校验
-	if (Value.Check(schema as never, normalized as never)) {
-		return { ok: true, args: normalized as Record<string, unknown> };
+	// 严格层：typebox schema 校验（schema 本身非法时给出工具定义错误，而非神秘堆栈）
+	try {
+		if (Value.Check(schema as never, normalized as never)) {
+			return { ok: true, args: normalized as Record<string, unknown> };
+		}
+	} catch (err) {
+		return {
+			ok: false,
+			message: `Tool "${tool.name}" 参数 schema 非法（parameters 必须是 typebox schema）: ${
+				err instanceof Error ? err.message : String(err)
+			}`,
+		};
 	}
 
 	// 友好错误：逐条列出错误路径 + 原因 + 模型实际发了什么 + 下一步指令
