@@ -46,6 +46,11 @@ class LineQueue {
 			this.waiter = resolve;
 		});
 	}
+
+	/** 非阻塞读取：只取已缓冲的行（agent 干活期间用户输入会堆在这里），不等待新输入 */
+	tryNext(): string | null {
+		return this.pending.shift() ?? null;
+	}
 }
 
 // 初始模型：命令行参数 > 第一个配了 Key 的 > 第一个
@@ -105,6 +110,12 @@ const systemPrompt =
 const rl = readline.createInterface({ input: process.stdin, terminal: process.stdin.isTTY });
 const lines = new LineQueue(rl);
 
+console.log("提示：agent 执行期间可直接输入消息进行 steering（回合边界生效），输入 exit 在当前回合结束后退出");
+
+// 用户在 agent 忙碌期间输入 exit → 本回合结束后退出（quitRequested 由会话层转换，
+// 循环层只认 getUserMessage 返回 null）
+let quitRequested = false;
+
 try {
 	await agentLoop(
 		{
@@ -114,6 +125,7 @@ try {
 			state,
 			getUserMessage: async () => {
 				while (true) {
+					if (quitRequested) return null;
 					if (process.stdin.isTTY) process.stdout.write("\n你: ");
 					const input = await lines.next();
 					if (input === null) return null; // EOF / 管道结束，正常退出
@@ -126,6 +138,17 @@ try {
 					return input;
 				}
 			},
+			// steering：agent 忙碌期间用户输入的行已缓冲在 LineQueue 里，
+			// 回合边界逐条取走（one-at-a-time，对齐 pi 默认 QueueMode）
+			getSteeringMessages: async () => {
+				const line = lines.tryNext();
+				if (line === null) return [];
+				if (line.trim() === "exit") {
+					quitRequested = true;
+					return [];
+				}
+				return [{ role: "user", content: line }];
+			},
 		},
 		(event) => {
 			switch (event.type) {
@@ -137,6 +160,9 @@ try {
 					break;
 				case "tool_execution_end":
 					if (event.isError) console.log(`  ⚠️  ${event.tool} 出错（已把错误回填给模型）`);
+					break;
+				case "steering_applied":
+					console.log(`  ↩️  [steering] ${event.content}`);
 					break;
 				case "agent_end":
 					rl.close();

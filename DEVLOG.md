@@ -238,3 +238,45 @@ src/agent/agent-loop.ts # 内层循环的截断保护分支（对照 pi failTool
 驱动层控制）。阶段 4 做失败恢复时应一并处理。
 
 ---
+
+## F6 · Steering（2026-09-30）
+
+**做了什么**
+
+agent 执行期间用户输入不再丢失：新输入缓存在会话层（LineQueue），
+内层循环在每个回合边界（工具结果回填后、下一次 LLM 调用前）轮询
+`getSteeringMessages`，取到的消息作为普通 user 消息注入。one-at-a-time
+语义（每回合最多注入一条，对齐 pi 默认 QueueMode）。执行期间输入
+`exit` 转换为"当前回合结束后退出"。
+
+**代码结构**
+
+```
+src/agent/agent-loop.ts  # AgentLoopConfig.getSteeringMessages 钩子 + 回合边界轮询注入
+src/main.ts              # LineQueue.tryNext() 非阻塞取行；exit→quitRequested 转换
+```
+
+**关键设计决策（对照 pi）**
+
+1. **不套第三层循环**：steering = 两条 FIFO 队列 + 回合边界的固定轮询点
+   （pi: agent-loop.ts:294；另有进入循环前 L174 与 prepareNextTurn 后 L203
+   两处补查，mini-pi 简化为一处）。
+2. **注入点收敛在回合边界**：不中止流式输出、不打断 in-flight 工具
+   （pi 中那是独立的 abort 通道：Esc → AbortController 贯穿流式与工具执行，
+   mini-pi 暂未实现）。工具批次必须整体跑完才轮询——并行批次的中途插入
+   会让结果配对变复杂，pi 也选择不做。
+3. **轮询必须在 break 之前**：内层循环条件等价于
+   `hasMoreToolCalls || pendingMessages.length > 0`（pi L182）——
+   纯文本回复 + 队列有消息时也要再跑一回合，否则 steering 被吞掉。
+4. **one-at-a-time**：多条插入按 FIFO 每回合消费一条，每条独立影响一次
+   推理，避免一次性灌入互相矛盾的多条消息（pi 默认行为）。
+5. **退出信号分层**：执行期间 `exit` 由会话层转成 quitRequested，
+   循环层只认 getUserMessage 的 null（mock 测试曾因违反此约定死循环）。
+6. **未实现（对照 pi 的差距）**：followUp 队列（agent 本该停时才消费）、
+   all 模式、abort 硬中断、UI 队列展示与取回（pi 的 Esc 退回编辑器）。
+
+**验证**：typecheck 通过；mock 验证（注入时序、请求 2 含 steering 消息、
+两条排队消息各占一回合、正常退出）；真机端到端（`sleep 8` 执行中第 3 秒
+插入 steering → 回合边界注入 → 模型总结包含指定语句，exit 0）。
+
+---
