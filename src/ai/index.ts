@@ -1,13 +1,16 @@
-// 最薄的 LLM 层：OpenAI 兼容 /chat/completions，非流式。
-// 内部消息格式 provider 中立；出网前在"调用边界"转成 wire format
-// （对照 pi："Transforms to Message[] only at the LLM call boundary"）。
-// 阶段 3 会对照 packages/ai 重写为流式 + 统一错误契约。
+// LLM 层：OpenAI 兼容协议 + 流式输出 + 连接阶段重试。
+// 对照 pi: packages/ai 的精简版——
+//   流事件契约 ≈ AssistantMessageEvent（types.ts:732）
+//   SSE 解析   ≈ iterateSseMessages（anthropic-messages.ts:411）
+//   重试       ≈ provider-retry.ts（只重试连接阶段，流开始后不重试）
+// 内部消息格式 provider 中立；出网前在"调用边界"转成 wire format。
 import type { ModelDef } from "./models.js";
 import { resolveApiKey } from "./models.js";
+import { iterateSseData } from "./sse.js";
 
 export type ChatRole = "system" | "user" | "assistant" | "toolResult";
 
-/** 模型发起的工具调用（assistant 消息携带；arguments 保持 wire 的 JSON 字符串，执行边界才 parse） */
+/** 模型发起的工具调用（assistant 消息携带；arguments 保持 wire 的 JSON 字符串） */
 export interface ToolCall {
 	id: string;
 	name: string;
@@ -19,9 +22,7 @@ export interface ChatMessage {
 	content: string;
 	/** assistant：谁生成的（对照 pi 的 AssistantMessage.provider/model 字段） */
 	model?: string;
-	/** assistant：模型要求的工具调用 */
 	toolCalls?: ToolCall[];
-	/** toolResult：对应哪次调用 */
 	toolCallId?: string;
 	toolName?: string;
 	isError?: boolean;
@@ -31,28 +32,33 @@ export interface ChatMessage {
 export interface ToolSchema {
 	name: string;
 	description: string;
-	parameters: Record<string, unknown>; // JSON Schema
+	parameters: Record<string, unknown>;
 }
 
-/** 模型的一次回复：文本 +（可能为空的）工具调用列表 + 停止原因 */
+/** 一次回复的最终形态（流 done 事件的 message 字段） */
 export interface AssistantReply {
 	content: string;
 	toolCalls: ToolCall[];
-	/**
-	 * 停止原因（OpenAI 兼容的 finish_reason 原值透传）。
-	 * "length" = 输出 token 上限截断——此时 tool_calls 参数可能不完整，
-	 * 循环层必须据此拒绝执行（对照 pi：Anthropic 的 "max_tokens" 在阶段 3 统一映射）。
-	 */
 	stopReason: string;
 }
+
+/**
+ * 流式事件契约（对照 pi 的 AssistantMessageEvent 精简版）。
+ * text_delta/toolcall_* 是增量；done 携带组装完成的完整消息。
+ */
+export type AssistantStreamEvent =
+	| { type: "text_delta"; delta: string }
+	| { type: "toolcall_start"; index: number; id: string; name: string }
+	| { type: "toolcall_delta"; index: number; delta: string }
+	| { type: "done"; stopReason: string; message: AssistantReply }
+	| { type: "error"; error: unknown };
 
 export type StreamFn = (
 	messages: ChatMessage[],
 	model: ModelDef,
 	tools: ToolSchema[],
-	/** 取消信号：用户 abort 时取消进行中的 HTTP 请求（对齐 pi 的 signal 贯穿） */
 	signal?: AbortSignal,
-) => Promise<AssistantReply>;
+) => AsyncIterable<AssistantStreamEvent>;
 
 // —— 调用边界：内部统一格式 → OpenAI wire format ——
 function toWire(messages: ChatMessage[]): unknown[] {
@@ -81,17 +87,76 @@ function resolveEndpoint(base: string): string {
 	return trimmed.endsWith("/chat/completions") ? trimmed : `${trimmed}/chat/completions`;
 }
 
-export const defaultStreamFn: StreamFn = async (messages, model, tools, signal) => {
+// —— 重试（对照 pi: provider-retry.ts）——
+// 只重试"连接阶段"（拿到响应流之前）；流开始后的中断不重试，直接 error 事件。
+const RETRY_BASE_MS = 500;
+const RETRY_CAP_MS = 8000;
+
+function isRetryableStatus(status: number): boolean {
+	return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(resolve, ms);
+		signal?.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				reject(new DOMException("Aborted", "AbortError"));
+			},
+			{ once: true },
+		);
+	});
+}
+
+/** 指数退避 + 抖动（对照 pi 的 0.5s×2^n cap 8s 带 25% 抖动） */
+function backoffDelay(attempt: number, retryAfterMs?: number): number {
+	if (retryAfterMs && retryAfterMs > 0) return Math.min(retryAfterMs, RETRY_CAP_MS);
+	const base = Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_CAP_MS);
+	return Math.floor(base * (0.75 + Math.random() * 0.5)); // ±25% 抖动
+}
+
+async function fetchWithRetry(body: Record<string, unknown>, apiKey: string, signal?: AbortSignal): Promise<Response> {
+	const endpoint = resolveEndpoint(process.env.LLM_BASE_URL ?? "https://api.deepseek.com");
+	const maxRetries = Number(process.env.LLM_MAX_RETRIES ?? 3);
+	for (let attempt = 0; ; attempt++) {
+		let res: Response;
+		try {
+			res = await fetch(endpoint, {
+				method: "POST",
+				headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+				body: JSON.stringify(body),
+				signal,
+			});
+		} catch (err) {
+			// 网络错误：未中止且还有额度则退避重试
+			if (signal?.aborted || attempt >= maxRetries) throw err;
+			await abortableSleep(backoffDelay(attempt), signal);
+			continue;
+		}
+		if (res.ok) return res;
+		const text = await res.text().catch(() => "");
+		if (signal?.aborted || attempt >= maxRetries || !isRetryableStatus(res.status)) {
+			throw new Error(`LLM HTTP ${res.status}: ${text}`);
+		}
+		const retryAfterSec = Number(res.headers.get("retry-after"));
+		const retryAfterMs = Number(res.headers.get("retry-after-ms")) || (retryAfterSec > 0 ? retryAfterSec * 1000 : 0);
+		await res.body?.cancel().catch(() => {});
+		await abortableSleep(backoffDelay(attempt, retryAfterMs), signal);
+	}
+}
+
+export const defaultStreamFn: StreamFn = async function* (messages, model, tools, signal) {
 	const apiKey = resolveApiKey(model);
 	if (!apiKey) {
-		throw new Error(
-			`未找到 ${model.provider} 的 API Key：请在 mini-pi/.env 中设置 ${model.apiKeyEnv}`,
-		);
+		throw new Error(`未找到 ${model.provider} 的 API Key：请在 mini-pi/.env 中设置 ${model.apiKeyEnv}`);
 	}
 
 	const body: Record<string, unknown> = {
 		model: model.apiModel,
 		messages: toWire(messages),
+		stream: true, // 阶段 3：从"全量等待"升级为流式
 	};
 	if (tools.length) {
 		body.tools = tools.map((t) => ({
@@ -99,48 +164,72 @@ export const defaultStreamFn: StreamFn = async (messages, model, tools, signal) 
 			function: { name: t.name, description: t.description, parameters: t.parameters },
 		}));
 	}
-	// 输出上限（请求侧控制）：不设则用 provider 默认。配合循环层的截断保护使用
 	const maxTokens = process.env.LLM_MAX_TOKENS;
 	if (maxTokens) body.max_tokens = Number(maxTokens);
 
-	// 请求超时：LLM 长响应可能很慢，但连接级挂死必须有上限（LLM_TIMEOUT_MS 可覆盖）
 	const timeoutMs = Number(process.env.LLM_TIMEOUT_MS ?? 120_000);
-	// 合并两个取消源：超时 + 用户 abort（AbortSignal.any 任一触发即取消）
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
-	const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
-	const res = await fetch(resolveEndpoint(model.baseUrl), {
-		method: "POST",
-		headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-		body: JSON.stringify(body),
-		signal: combinedSignal,
-	}).catch((err: unknown) => {
-		if (err instanceof Error && err.name === "TimeoutError") {
-			throw new Error(`LLM 请求超时（${timeoutMs}ms）：${model.provider} 无响应，可稍后重试或调大 LLM_TIMEOUT_MS`);
-		}
-		throw err;
-	});
-	if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${await res.text()}`);
+	const combined = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
 
-	const data = (await res.json()) as {
-		choices?: Array<{
-			message?: {
-				content?: string | null;
-				tool_calls?: Array<{ id: string; function?: { name?: string; arguments?: string } }>;
+	const res = await fetchWithRetry(body, apiKey, combined);
+
+	// —— 流式组装：partial 可变消息（对照 pi 的 output 对象就地修改）——
+	let content = "";
+	const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+	let stopReason = "stop";
+
+	try {
+		for await (const data of iterateSseData(res, combined)) {
+			let chunk: {
+				choices?: Array<{
+					delta?: {
+						content?: string | null;
+						tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
+					};
+					finish_reason?: string | null;
+				}>;
 			};
-			finish_reason?: string;
-		}>;
-	};
-	const choice = data.choices?.[0];
-	const msg = choice?.message;
-	if (!msg) throw new Error("LLM 响应缺少 choices[0].message");
+			try {
+				chunk = JSON.parse(data);
+			} catch {
+				continue; // 单帧损坏跳过，不炸整个流
+			}
+			const choice = chunk.choices?.[0];
+			if (!choice) continue;
+			const delta = choice.delta ?? {};
 
-	return {
-		content: msg.content ?? "",
-		toolCalls: (msg.tool_calls ?? []).map((c) => ({
-			id: c.id,
-			name: c.function?.name ?? "",
-			arguments: c.function?.arguments ?? "{}",
-		})),
-		stopReason: choice.finish_reason ?? "stop",
-	};
+			if (delta.content) {
+				content += delta.content;
+				yield { type: "text_delta", delta: delta.content };
+			}
+			for (const tc of delta.tool_calls ?? []) {
+				const index = tc.index ?? 0;
+				let entry = toolCalls.get(index);
+				if (!entry) {
+					// 该调用的首个 chunk：携带完整 id/name，arguments 从空串开始累加
+					entry = { id: tc.id ?? "", name: tc.function?.name ?? "", arguments: "" };
+					toolCalls.set(index, entry);
+					yield { type: "toolcall_start", index, id: entry.id, name: entry.name };
+				}
+				if (tc.function?.arguments) {
+					entry.arguments += tc.function.arguments;
+					yield { type: "toolcall_delta", index, delta: tc.function.arguments };
+				}
+			}
+			if (choice.finish_reason) stopReason = choice.finish_reason;
+		}
+	} catch (err) {
+		if (combined.aborted) {
+			// 用户中止/超时：已生成的部分内容仍以 done(aborted) 交付，循环层决定去留
+			const ordered = [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+			yield { type: "done", stopReason: "aborted", message: { content, toolCalls: ordered, stopReason: "aborted" } };
+			return;
+		}
+		yield { type: "error", error: err };
+		return;
+	}
+
+	// 流正常结束：按 index 顺序还原 tool_calls
+	const ordered = [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+	yield { type: "done", stopReason, message: { content, toolCalls: ordered, stopReason } };
 };

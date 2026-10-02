@@ -9,7 +9,7 @@
 //
 // 分层约定：循环只读 state.model、只发事件；命令解析/退出约定在会话层（main.ts），
 // getUserMessage 返回 null 才是循环认识的退出信号。
-import type { ChatMessage, StreamFn } from "../ai/index.js";
+import type { AssistantReply, ChatMessage, StreamFn } from "../ai/index.js";
 import type { ModelDef } from "../ai/models.js";
 import type { AgentTool } from "./tools.js";
 import { validateToolArguments } from "./validation.js";
@@ -38,6 +38,7 @@ export interface AgentLoopConfig {
 export type AgentEvent =
 	| { type: "agent_start" }
 	| { type: "turn_start"; input: string }
+	| { type: "message_update"; delta: string; model: ModelDef }
 	| { type: "message_end"; content: string; model: ModelDef }
 	| { type: "tool_execution_start"; tool: string; argsPreview: string }
 	| { type: "tool_execution_end"; tool: string; isError: boolean }
@@ -89,22 +90,40 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 
 			const currentModel = config.state.model;
 
-			let reply;
+			// 消费流式事件：delta 逐个转发给 UI（对照 pi 的 message_update 透传），
+			// done 携带组装完成的完整消息，交给既有的校验/截断/执行逻辑
+			let reply: AssistantReply | undefined;
 			try {
-				reply = await config.streamFn(
+				for await (const event of config.streamFn(
 					[{ role: "system", content: config.systemPrompt }, ...history],
 					currentModel,
 					// 只把 wire 层需要的字段给 ai 包（AgentTool 的 execute 不出 agent 包）
 					config.tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
 					signal,
-				);
+				)) {
+					if (event.type === "text_delta") {
+						onEvent({ type: "message_update", delta: event.delta, model: currentModel });
+					} else if (event.type === "done") {
+						reply = event.message;
+					} else if (event.type === "error") {
+						throw event.error;
+					}
+				}
 			} catch (err) {
 				// 用户中止导致的请求取消 ≠ 轮次级故障：优雅结束本任务，回到提示符
 				if (signal?.aborted) {
 					endReason = "aborted";
 					break;
 				}
-				throw err; // 其余 LLM 错误仍上抛（阶段 3 重试 / 阶段 4 恢复接管）
+				throw err; // 其余 LLM 错误仍上抛（阶段 4 恢复接管）
+			}
+			if (!reply) {
+				// 流在 done 之前结束：中止则优雅退出，否则视为轮次级故障
+				if (signal?.aborted) {
+					endReason = "aborted";
+					break;
+				}
+				throw new Error("LLM 流在完成前结束");
 			}
 
 			history.push({

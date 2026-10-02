@@ -320,3 +320,51 @@ src/main.ts              # LineQueue.tryNext() 非阻塞取行；exit→quitRequ
 validation.ts:323）。
 
 ---
+
+## F8 · 流式输出 + 连接阶段重试（阶段 3，2026-10-01）
+
+**做了什么**
+
+`defaultStreamFn` 从"全量等待"升级为流式：`stream: true` + 手工 SSE 解析，
+`StreamFn` 返回值从 `Promise<AssistantReply>` 升级为 `AsyncIterable<AssistantStreamEvent>`
+（text_delta / toolcall_start / toolcall_delta / done / error）。循环层逐 delta
+转发 `message_update`，UI 收到 delta 立即写 stdout。连接阶段失败（网络错误、
+408/409/429/5xx）自动指数退避重试（±25% 抖动、尊重 retry-after），流开始后
+不重试（对齐 pi）。abort 在流中途生效：已生成部分以 done(aborted) 交付。
+
+**代码结构**
+
+```
+src/ai/sse.ts           # iterateSseData：getReader + TextDecoder(stream) + 行缓冲（~50 行）
+src/ai/index.ts         # 流式事件契约 + partial 组装 + fetchWithRetry
+src/agent/agent-loop.ts # 消费 AsyncIterable，delta → message_update
+src/main.ts             # 首个 delta 打头部，之后增量写 stdout
+```
+
+**关键设计决策（对照 pi）**
+
+1. **SSE 手工解析**（对照 pi 的 iterateSseMessages，anthropic-messages.ts:411）：
+   `stream:true` 的 TextDecoder 处理跨 chunk 多字节字符；按行缓冲、凑齐即
+   yield——第一个 token 到达即可见，无额外批量缓冲。
+2. **partial 可变消息**（对照 pi 的 output 对象）：ai 层内部就地组装
+   content/toolCalls（tool_calls 按 index 跨 chunk 累加 arguments），done 时
+   交付完整 AssistantReply——循环层的校验/截断/执行逻辑零改动。
+3. **重试只覆盖连接阶段**：408/409/429/5xx + 网络错误，指数退避 0.5s×2^n
+   cap 8s 抖动 ±25%，尊重 retry-after(-ms)，sleep 可被 signal 中断；流中断
+   属于"已消费部分响应"，重试会导致重复生成，故只报 error（pi 同款边界）。
+4. **abort 在流式中**：combined signal 让 reader.read() 立即 reject，
+   partial 内容以 done(aborted) 交付；循环层 signal.aborted 分支优雅收尾。
+5. **tool_calls 流式拼装**：id/name 只在首 chunk 出现，后续 chunk 只有
+   index + arguments 片段——ai 层维护 Map<index, entry>，done 时按 index
+   排序还原（对照协议抓包结论）。
+
+**验证**：typecheck 通过；本地 SSE mock 服务器三场景（流式组装/500 重试/
+中途 abort）全过；真机端到端（流式回复 + 工具调用 + 文件落盘 + exit 0；
+`/stop` 在流式中途打断 3000 字长文，文本半句截断、立即回到提示符）。
+
+**排障记录**：两次"abort 未生效"实为测试时序竞争——模型数到 100 约 4-5s
+即完成，/stop（5s）到达时任务已结束；改用"禁用工具的 3000 字长文"才稳定
+复现中途窗口。教训：**测中断类逻辑要先证明目标仍在运行**（探针 stderr +
+时间戳定位）。
+
+---

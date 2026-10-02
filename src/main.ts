@@ -130,6 +130,8 @@ let quitRequested = false;
 // 每个任务一个 AbortController（对齐 pi：activeRun.abortController）
 let abortController: AbortController | null = null;
 let busy = false;
+// 当前回合是否已开始流式打印（决定 message_end 是补换行还是全量打印）
+let streamingLine = false;
 
 const lines = new LineQueue(rl, (line) => {
 	// /stop 在 agent 忙碌时立即中止当前任务（abort 是独立通道，不走消息队列）
@@ -183,9 +185,23 @@ try {
 			switch (event.type) {
 				case "turn_start":
 					busy = true;
+					streamingLine = false;
+					break;
+				case "message_update":
+					// 流式增量：首个 delta 先打印头部，之后逐段写 stdout（无缓冲直出）
+					if (!streamingLine) {
+						process.stdout.write(`\n🤖 [${event.model.provider}/${event.model.modelId}] `);
+						streamingLine = true;
+					}
+					process.stdout.write(event.delta);
 					break;
 				case "message_end":
-					console.log(`\n🤖 [${event.model.provider}/${event.model.modelId}] ${event.content}`);
+					if (streamingLine) {
+						process.stdout.write("\n"); // 流式打印已输出内容，只补换行
+						streamingLine = false;
+					} else {
+						console.log(`\n🤖 [${event.model.provider}/${event.model.modelId}] ${event.content}`);
+					}
 					break;
 				case "tool_execution_start":
 					console.log(`  ⚙️  ${event.tool} ${event.argsPreview}`);
