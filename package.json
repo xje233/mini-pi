@@ -9,7 +9,8 @@
 	},
 	"scripts": {
 		"start": "tsx --env-file-if-exists=.env src/main.ts",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "for f in tests/*.test.mjs; do echo \"== $f\"; tsx \"$f\" || exit 1; done"
 	},
 	"dependencies": {
 		"@sinclair/typebox": "^0.34.33"

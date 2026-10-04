@@ -3,10 +3,14 @@
 // 对照 pi：斜杠命令在会话层（slash-commands.ts）拦截，到不了 agent 循环。
 import readline from "node:readline";
 import { defaultStreamFn } from "./ai/index.js";
+import type { ChatMessage } from "./ai/index.js";
 import { MODELS, listModels, resolveApiKey, resolveModel } from "./ai/models.js";
 import type { ModelDef } from "./ai/models.js";
 import { agentLoop, type AgentState } from "./agent/agent-loop.js";
+import { DEFAULT_COMPACTION, type CompactionOptions } from "./agent/compaction.js";
 import { createTools } from "./agent/tools.js";
+import { createEnforceGate, filterVisibleTools, ToolRegistry, type DenyRule } from "./agent/tool-registry.js";
+import { SessionManager, replaySession } from "./session/session-manager.js";
 
 /**
  * 行队列（ERR-003）：readline/promises 的 question() 在第一次 resolve 后
@@ -61,15 +65,16 @@ class LineQueue {
 	}
 }
 
-// 初始模型：命令行参数 > 第一个配了 Key 的 > 第一个
+// 初始模型：命令行参数 > （--resume 时）会话里上次的模型 > 第一个配了 Key 的 > 第一个
+const modelArg = process.argv.slice(2).find((a) => !a.startsWith("--"));
 let initialModel: ModelDef | undefined;
-if (process.argv[2]) {
-	const result = resolveModel(process.argv[2]);
+if (modelArg) {
+	const result = resolveModel(modelArg);
 	if (!result.ok) {
 		console.error(
 			result.reason === "ambiguous"
-				? `模型 "${process.argv[2]}" 有歧义，候选:\n${listModels()}`
-				: `未知模型: ${process.argv[2]}\n可用模型:\n${listModels()}`,
+				? `模型 "${modelArg}" 有歧义，候选:\n${listModels()}`
+				: `未知模型: ${modelArg}\n可用模型:\n${listModels()}`,
 		);
 		process.exit(1);
 	}
@@ -84,6 +89,31 @@ if (!initialModel) {
 
 // 状态由会话层持有（对照 pi：AgentSession 持有并修改 agent.state.model）
 const state: AgentState = { model: initialModel };
+// 消息 → 会话 entry id 的映射（compaction 的 firstKeptEntryId 靠它定位保留区起点）
+const messageEntryIds = new WeakMap<object, number>();
+
+// —— 会话持久化（对照 pi：session-manager 的追加式 JSONL；底账永不删除）——
+const resume = process.argv.includes("--resume");
+const session = (() => {
+	try {
+		return new SessionManager(".mini-pi/sessions", { resume });
+	} catch (err) {
+		console.error(`会话初始化失败: ${err instanceof Error ? err.message : String(err)}`);
+		process.exit(1);
+	}
+})();
+let resumedHistory: ChatMessage[] = [];
+if (resume) {
+	const replayed = replaySession(session.readEntries());
+	resumedHistory = replayed.history;
+	// 播种重放消息的 entry id：否则本进程压缩时定位不到保留区起点（F9 排障）
+	for (const [msg, id] of replayed.messageEntryIds) messageEntryIds.set(msg, id);
+	if (!modelArg && replayed.model) {
+		const r = resolveModel(`${replayed.model.provider}/${replayed.model.modelId}`);
+		if (r.ok) state.model = r.model;
+	}
+	console.log(`已恢复会话 ${session.file}（${replayed.history.length} 条消息）`);
+}
 
 /** /model 命令：无参列出模型；带参切换，切换前做 auth 预检（失败不切换） */
 function handleModelCommand(arg: string): void {
@@ -106,6 +136,7 @@ function handleModelCommand(arg: string): void {
 		return;
 	}
 	state.model = result.model;
+	session.append({ type: "model_change", provider: result.model.provider, modelId: result.model.modelId });
 	console.log(`[模型] ${state.model.provider}/${state.model.modelId}`);
 }
 
@@ -122,7 +153,28 @@ const rl = readline.createInterface({
 	terminal: process.stdin.isTTY,
 });
 
-console.log("提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止当前任务；exit = 退出");
+console.log("提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止；/compact = 手动压缩；exit = 退出（--resume 可恢复上次会话）");
+
+/**
+ * 会话行解析（忙碌/空闲两条路径共用——F9 排障：命令解析只在空闲路径做时，
+ * 执行期间输入的 /compact 会被当成 steering 消息喂给模型）。
+ * quit=true 表示用户要退出；messages 为空表示该行已被消费，无需注入。
+ */
+function parseSessionLine(line: string): { quit: boolean; messages: ChatMessage[] } {
+	const trimmed = line.trim();
+	if (trimmed === "exit") return { quit: true, messages: [] };
+	if (trimmed === "/stop") return { quit: false, messages: [] }; // busy 时已由 onLine 消费；空闲时忽略
+	if (trimmed.startsWith("/compact")) {
+		compaction.force = true;
+		console.log("已排程：下一次 LLM 请求前压缩上下文");
+		return { quit: false, messages: [] };
+	}
+	if (trimmed.startsWith("/model")) {
+		handleModelCommand(trimmed.slice("/model".length).trim());
+		return { quit: false, messages: [] };
+	}
+	return { quit: false, messages: [{ role: "user", content: line }] };
+}
 
 // 用户在 agent 忙碌期间输入 exit → 本回合结束后退出（quitRequested 由会话层转换，
 // 循环层只认 getUserMessage 返回 null）
@@ -133,13 +185,56 @@ let busy = false;
 // 当前回合是否已开始流式打印（决定 message_end 是补换行还是全量打印）
 let streamingLine = false;
 
-const lines = new LineQueue(rl, (line) => {
-	// /stop 在 agent 忙碌时立即中止当前任务（abort 是独立通道，不走消息队列）
-	if (busy && line.trim() === "/stop") {
-		abortController?.abort();
-		return true; // 已消费，不进入队列
+// —— 工具路由第一步：registry + expose/enforce 双层权限（对照调研文档第四节）——
+// ① 注册：全部工具进底账（first-registration-wins）
+const registry = new ToolRegistry();
+for (const tool of createTools()) registry.register(tool);
+
+// ② 暴露过滤：DENY_TOOLS（逗号分隔，模式：精确名 / domain:* / 前缀*）→ 模型看不见
+const denyPatterns = (process.env.DENY_TOOLS ?? "")
+	.split(",")
+	.map((s) => s.trim())
+	.filter(Boolean);
+const visibleTools = filterVisibleTools(registry.all(), denyPatterns);
+if (denyPatterns.length) {
+	const hidden = registry.all().length - visibleTools.length;
+	console.log(`[expose] 已按 DENY_TOOLS 隐藏 ${hidden} 个工具（模式: ${denyPatterns.join(", ")}）`);
+}
+
+// ③ 执行门控：ENFORCE_RULES 为 JSON 数组 [{ "tool": "run_command", "argsRegex": "\\brm\\b", "reason": "..." }]
+//    argsRegex 对参数 JSON 串匹配（对照 Claude Code 的 Bash(rm *) 参数级模式）
+const enforceRules: DenyRule[] = (() => {
+	const raw = process.env.ENFORCE_RULES;
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as DenyRule[];
+		if (!Array.isArray(parsed)) throw new Error("必须是数组");
+		return parsed;
+	} catch (err) {
+		console.error(`ENFORCE_RULES 解析失败: ${err instanceof Error ? err.message : String(err)}`);
+		process.exit(1);
 	}
-	return false;
+})();
+if (enforceRules.length) console.log(`[enforce] 已加载 ${enforceRules.length} 条执行门控规则`);
+
+// 压缩设置（可变对象：/compact 置 force，循环层消费后复位；参数可用环境变量调小以便测试）
+const compaction: CompactionOptions = {
+	reserveTokens: Number(process.env.COMPACT_RESERVE_TOKENS ?? DEFAULT_COMPACTION.reserveTokens),
+	keepRecentTokens: Number(process.env.COMPACT_KEEP_RECENT_TOKENS ?? DEFAULT_COMPACTION.keepRecentTokens),
+};
+
+const lines = new LineQueue(rl, (line) => {
+	// busy 时的行处理：/stop 立即 abort（独立通道）；exit 软退出；/compact 即时排程；
+	// 其余返回 false 进入缓冲作为 steering 消息
+	if (!busy) return false;
+	const trimmed = line.trim();
+	if (trimmed === "/stop") {
+		abortController?.abort();
+		return true;
+	}
+	const parsed = parseSessionLine(line);
+	if (parsed.quit) quitRequested = true;
+	return parsed.messages.length === 0;
 });
 
 try {
@@ -147,26 +242,25 @@ try {
 		{
 			systemPrompt,
 			streamFn: defaultStreamFn,
-			tools: createTools(),
+			tools: visibleTools,
 			state,
+			beforeToolCall: enforceRules.length ? createEnforceGate(enforceRules) : undefined,
 			maxTurns: Number(process.env.MAX_TURNS ?? 30),
 			getSignal: () => abortController?.signal,
+			initialHistory: resumedHistory,
+			compaction,
 			getUserMessage: async () => {
 				while (true) {
 					if (quitRequested) return null;
 					if (process.stdin.isTTY) process.stdout.write("\n你: ");
 					const input = await lines.next();
 					if (input === null) return null; // EOF / 管道结束，正常退出
-					if (input.trim() === "exit") return null;
-					if (input.trim() === "/stop") continue; // 空闲时 /stop 无意义，忽略
-					// 命令在本层消费，不进入循环
-					if (input.startsWith("/model")) {
-						handleModelCommand(input.slice("/model".length).trim());
-						continue;
-					}
+					const parsed = parseSessionLine(input);
+					if (parsed.quit) return null;
+					if (!parsed.messages.length) continue;
 					// 新任务开始：换新的取消信号
 					abortController = new AbortController();
-					return input;
+					return parsed.messages[0]!.content;
 				}
 			},
 			// steering：agent 忙碌期间用户输入的行已缓冲在 LineQueue 里，
@@ -174,11 +268,9 @@ try {
 			getSteeringMessages: async () => {
 				const line = lines.tryNext();
 				if (line === null) return [];
-				if (line.trim() === "exit") {
-					quitRequested = true;
-					return [];
-				}
-				return [{ role: "user", content: line }];
+				const parsed = parseSessionLine(line);
+				if (parsed.quit) quitRequested = true;
+				return parsed.messages;
 			},
 		},
 		(event) => {
@@ -211,6 +303,27 @@ try {
 					break;
 				case "steering_applied":
 					console.log(`  ↩️  [steering] ${event.content}`);
+					break;
+				case "message_appended":
+					// 底账：每条进入历史的消息都追加进会话文件
+					messageEntryIds.set(event.message, session.appendMessage(event.message));
+					break;
+				case "compaction_applied": {
+					// 底账不删：只追加 compaction 条目（重放时投影 = 摘要 + 保留区之后）
+					const firstKept = event.keptMessages[0];
+					session.append({
+						type: "compaction",
+						summary: event.summary,
+						firstKeptEntryId: firstKept ? (messageEntryIds.get(firstKept) ?? null) : null,
+						tokensBefore: event.tokensBefore,
+					});
+					console.log(
+						`  🗜️  [compaction] 约 ${event.tokensBefore} token → 摘要 + 保留 ${event.keptMessages.length} 条近期消息`,
+					);
+					break;
+				}
+				case "compaction_skipped":
+					console.log(`  🗜️  [compaction] 已跳过：${event.reason}`);
 					break;
 				case "limit_reached":
 					console.log(`\n⛔ 已达单任务最大工具轮次（${event.maxTurns}），进入强制收尾`);

@@ -11,6 +11,8 @@ export interface ModelDef {
 	apiKeyEnv: string;
 	/** 展示用 */
 	label: string;
+	/** 上下文窗口（token）：compaction 阈值的分母（近似值，provider 文档为准） */
+	contextWindow: number;
 }
 
 export const MODELS: ModelDef[] = [
@@ -21,6 +23,7 @@ export const MODELS: ModelDef[] = [
 		baseUrl: "https://api.deepseek.com",
 		apiKeyEnv: "DEEPSEEK_API_KEY",
 		label: "DeepSeek Chat",
+		contextWindow: 128_000,
 	},
 	{
 		provider: "deepseek",
@@ -29,6 +32,7 @@ export const MODELS: ModelDef[] = [
 		baseUrl: "https://api.deepseek.com",
 		apiKeyEnv: "DEEPSEEK_API_KEY",
 		label: "DeepSeek Reasoner",
+		contextWindow: 128_000,
 	},
 	{
 		provider: "glm",
@@ -37,6 +41,7 @@ export const MODELS: ModelDef[] = [
 		baseUrl: "https://open.bigmodel.cn/api/paas/v4",
 		apiKeyEnv: "GLM_API_KEY",
 		label: "GLM-4.6",
+		contextWindow: 200_000,
 	},
 	{
 		provider: "kimi",
@@ -45,6 +50,7 @@ export const MODELS: ModelDef[] = [
 		baseUrl: "https://api.moonshot.cn/v1",
 		apiKeyEnv: "MOONSHOT_API_KEY",
 		label: "Kimi K2",
+		contextWindow: 256_000,
 	},
 ];
 

@@ -368,3 +368,108 @@ src/main.ts             # 首个 delta 打头部，之后增量写 stdout
 时间戳定位）。
 
 ---
+
+## F9 · 会话持久化 + 自动压缩（阶段 4，2026-10-02）
+
+**做了什么**
+
+前两层 Memory：① 会话持久化——每个 session 一个 JSONL 文件
+（`.mini-pi/sessions/`），每条进历史的消息/模型切换/压缩条目都追加落盘，
+`--resume` 顺序重放恢复上下文与模型；② 自动压缩——每轮 LLM 请求前检查
+`estimateTokens > contextWindow - reserveTokens`，超限则 LLM 生成结构化摘要、
+保留最近 keepRecentTokens，替换**投影**（底账不删，只追加 compaction 条目）。
+手动 `/compact` 任意时刻排程。调研依据见 `docs/memory-research.md`。
+
+**代码结构**
+
+```
+docs/memory-research.md        # 三层 Memory 调研 + pi 实证（摘要 prompt 逐字、entry schema）
+src/session/session-manager.ts # JSONL 追加式底账 + replaySession 重放投影
+src/agent/compaction.ts        # 估算/阈值/切点/摘要 prompt（pi 逐字）/摘要生成
+src/agent/agent-loop.ts        # pushMessage 统一入口（persist 标志）+ 请求前压缩检查
+src/main.ts                    # 底账接线、--resume、/compact、parseSessionLine 统一命令解析
+```
+
+**关键设计决策（对照 pi）**
+
+1. **投影变、底账不变**：compaction 只是追加一条
+   `{summary, firstKeptEntryId, tokensBefore}`；重放 = 摘要消息 +
+   `id >= firstKeptEntryId` 的消息。摘要消息只存在于投影（persist=false），
+   其持久形态就是 compaction 条目。
+2. **切点安全**：keepRecent 从尾部累加，切点只能落在 user/assistant——
+   tool_call/toolResult 配对永不切开（pi 的 findValidCutPoints）。
+3. **摘要 prompt 逐字照抄 pi**：结构化格式
+   （Goal/Constraints/Progress/Decisions/Next Steps/Critical Context），
+   要求精确保留路径/函数名/错误信息——摘要是写给下一个 LLM 的提示词。
+4. **估算 = 字符数/4**（pi 的 CHARS_PER_TOKEN=4，无 CJK 特判）——粗但够用，
+   有 usage 实测锚定是后续改进。
+5. **压缩检查在每轮请求前**（pi 的 prepareNextTurnWithContext 安装点），
+   摘要生成是独立 LLM 调用（同模型、无 tools）。
+6. **命令解析统一**：忙碌/空闲两条路径共用 parseSessionLine——否则执行期间
+   输入的 /compact 会被当成 steering 消息喂给模型（排障中实测撞上）。
+
+**排障记录**
+
+- `firstKeptEntryId=null` 事故：--resume 进程里重放消息不在
+  messageEntryIds（WeakMap 仅本进程追加时填充）→ 压缩定位不到保留区起点 →
+  重放丢保留区。修复：replaySession 返回 messageEntryIds，恢复时播种。
+- 摘要消息曾误持久化为 message entry（会导致重放双重摘要）——改为
+  persist=false。
+- 手动 /compact 在"近期消息未超 keepRecent"时被静默吞掉——增加
+  compaction_skipped 事件。
+- 测试时序竞争三连：/stop、/compact 总是慢于任务完成（模型太快）；
+  `grep | head` 关管道触发 EPIPE 杀进程。教训同 F5/F7：**测中断/插桩类
+  逻辑要先保证执行窗口，输出重定向到文件而非管道截断**。
+
+**验证**：typecheck 通过；确定性三用例（JSONL roundtrip 含压缩投影/resume
+续写、切点安全、循环集成压缩后 token 950→131）；真机端到端（创建任务落盘
+→ --resume 无工具回答文件内容 → 多轮任务中 /compact 真实触发（165 token →
+摘要 + 保留 6 条）→ 压缩后二次恢复，模型凭摘要准确报出 10 个文件）。
+
+---
+
+## F10 · 代码审查 + 回归测试套件（2026-10-02）
+
+**做了什么**
+
+以 DEVLOG 记录的行为为基准逐文件审查，发现并修复 2 个高危缺陷 + 3 个小问题；
+把散落在 /tmp 的确定性测试重建为项目内测试套件（`tests/`，`npm test`，13 项）。
+
+**修复的高危缺陷**
+
+1. **超时/中止通道混淆**（`ai/index.ts` SSE catch）：`combined.aborted` 同时
+   覆盖「用户中止」和「超时」，超时被伪装成 `done(aborted)` 交付**半截
+   toolCalls**。修复：只有 `signal?.aborted`（用户）才走 aborted，超时走
+   error 通道。真机验证：`LLM_TIMEOUT_MS=5000` + 长散文 → 文本流到 5s 截断
+   并报 `The operation was aborted due to timeout`，exit 1。
+2. **循环层缺 `stopReason === "aborted"` 分支**（同源缺陷的另一半）：中止时
+   交付的 partial toolCalls 会进入正常执行路径——半截参数直接执行（F5 截断
+   保护要防的事故类别，经 abort 通道绕过）。修复：aborted 时全部不执行、
+   逐个回填 `Operation aborted`（保持协议配对），`turn_end(aborted)`。
+
+**修复的小问题**
+
+3. 压缩摘要调用缺 abort 感知 catch：中止会炸成顶层错误（exit 1）而非优雅
+   `turn_end(aborted)`——已补 try/catch。
+4. `iterateSseData` 残余 buffer 未清 `\r`。
+5. `.env.example` 补全全部旋钮（timeout/retries/max_tokens/MAX_TURNS/
+   COMPACT_*），此前新增的开关无处可查。
+
+**已知未修项（记录）**
+
+- `estimateTokens` 不计 system prompt 与 tools schema 的 token——阈值偏乐观
+  （pi 的 estimateMessageTokens 计入两者）。
+- `SessionManager.readEntries` 遇损坏行整体失败（应逐行容错跳过）。
+- `/model` 切到当前同一模型也会追加 model_change 条目（无害冗余）。
+- 压缩后若仍超阈值会立即再压（无冷却/最小间隔；pi 用 tokensBefore 与
+  firstKeptEntryId 规避）。
+
+**测试套件**（`npm test`，13 项全绿）：`tests/stream.test.mjs`（SSE 组装/
+500 重试/流中 abort）、`tests/session-compaction.test.mjs`（roundtrip/切点/
+循环压缩）、`tests/control.test.mjs`（截断/steering/abort/maxTurns）、
+`tests/review-fixes.test.mjs`（本次审查的三条修复）。
+
+**教训**：`/tmp` 会被系统清理，回归测试必须住在项目里——这也是本轮重建
+测试套件的直接触发原因。
+
+---

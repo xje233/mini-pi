@@ -36,8 +36,8 @@ export async function* iterateSseData(response: Response, signal?: AbortSignal):
 				if (data) yield data;
 			}
 		}
-		// 流异常截断时 flushing 残余 buffer（对照 pi 的 flush 逻辑）
-		const rest = buffer.trim();
+		// 流异常截断时 flushing 残余 buffer（对照 pi 的 flush 逻辑；清掉可能的 \r 尾巴）
+		const rest = buffer.replace(/\r+$/, "").trim();
 		if (rest.startsWith("data:")) yield rest.slice(5).trimStart();
 	} finally {
 		reader.releaseLock();

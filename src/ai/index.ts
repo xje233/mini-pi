@@ -219,13 +219,15 @@ export const defaultStreamFn: StreamFn = async function* (messages, model, tools
 			if (choice.finish_reason) stopReason = choice.finish_reason;
 		}
 	} catch (err) {
-		if (combined.aborted) {
-			// 用户中止/超时：已生成的部分内容仍以 done(aborted) 交付，循环层决定去留
+		// 区分两个取消源（审查修复）：用户中止 → partial 以 aborted 交付；
+		// 超时（combined 但非用户中止）→ error 通道，绝不能把半截 toolCalls
+		// 伪装成 aborted 交给循环层执行
+		if (signal?.aborted) {
 			const ordered = [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
 			yield { type: "done", stopReason: "aborted", message: { content, toolCalls: ordered, stopReason: "aborted" } };
 			return;
 		}
-		yield { type: "error", error: err };
+		yield { type: "error", error: err instanceof Error ? err : new Error(String(err)) };
 		return;
 	}
 

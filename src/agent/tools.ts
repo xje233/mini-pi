@@ -13,6 +13,10 @@ const execAsync = promisify(exec);
 /** 对照 pi: packages/agent/src/types.ts 的 AgentTool（精简版：去掉钩子/onUpdate） */
 export interface AgentTool extends ToolSchema {
 	label: string;
+	/** 领域元数据（fs/shell/net/…）：权限 glob（domain:*）与软路由检索的消费对象 */
+	domain: string;
+	/** 附加标签：软路由检索的关键词来源（阶段二启用） */
+	tags?: string[];
 	/** signal：用户 abort 时工具应尽快终止（如 kill 子进程）并抛错 */
 	execute(args: Record<string, unknown>, signal?: AbortSignal): Promise<string>;
 }
@@ -21,6 +25,7 @@ export const createTools = (): AgentTool[] => [
 	{
 		name: "read_file",
 		label: "读文件",
+		domain: "fs",
 		description: "读取文本文件的全部内容。参数：path（文件路径）。",
 		parameters: Type.Object({
 			path: Type.String({ description: "要读取的文件路径" }),
@@ -30,6 +35,7 @@ export const createTools = (): AgentTool[] => [
 	{
 		name: "write_file",
 		label: "写文件",
+		domain: "fs",
 		description: "把文本写入文件，目录不存在会自动创建，已存在则覆盖。参数：path、content。",
 		parameters: Type.Object({
 			path: Type.String({ description: "目标文件路径" }),
@@ -46,6 +52,7 @@ export const createTools = (): AgentTool[] => [
 	{
 		name: "list_dir",
 		label: "列目录",
+		domain: "fs",
 		description: "列出目录下的文件和子目录（子目录以 / 结尾）。参数：path（目录路径，默认当前目录）。",
 		parameters: Type.Object({
 			path: Type.Optional(Type.String({ description: "目录路径" })),
@@ -62,6 +69,7 @@ export const createTools = (): AgentTool[] => [
 	{
 		name: "run_command",
 		label: "执行命令",
+		domain: "shell",
 		description: "在当前工作目录执行 shell 命令，返回 stdout 与 stderr（超时 30 秒）。参数：command。",
 		parameters: Type.Object({
 			command: Type.String({ description: "要执行的 shell 命令" }),
