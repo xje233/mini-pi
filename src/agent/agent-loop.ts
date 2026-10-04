@@ -14,6 +14,7 @@ import type { ModelDef } from "../ai/models.js";
 import type { AgentTool } from "./tools.js";
 import { validateToolArguments } from "./validation.js";
 import { compactHistory, estimateTokens, shouldCompact, summaryMessage, type CompactionOptions } from "./compaction.js";
+import { diffToolSets, toolChangesMessage } from "./soft-routing.js";
 
 // 对照 pi 的 AgentState：跨轮次的可变状态由上层持有，循环只读
 export interface AgentState {
@@ -40,6 +41,8 @@ export interface AgentLoopConfig {
 		tool: AgentTool;
 		args: Record<string, unknown>;
 	}) => Promise<{ block?: boolean; reason?: string } | undefined> | { block?: boolean; reason?: string } | undefined;
+	// 软路由：取当前活跃工具集（可被 search_tools 原地修改）。缺省 = config.tools 静态集
+	getActiveTools?: () => AgentTool[];
 	// 恢复会话时带入的历史（投影后，来自 SessionManager 重放）
 	initialHistory?: ChatMessage[];
 	// 自动压缩（对照 pi 的 prepareNextTurnWithContext 钩子 + compaction 设置）
@@ -58,6 +61,7 @@ export type AgentEvent =
 	| { type: "message_appended"; message: ChatMessage }
 	| { type: "compaction_applied"; summary: string; tokensBefore: number; keptMessages: ChatMessage[] }
 	| { type: "compaction_skipped"; reason: string }
+	| { type: "tools_changed"; added: string[]; removed: string[] }
 	| { type: "limit_reached"; maxTurns: number }
 	| { type: "turn_end"; reason: "completed" | "aborted" | "max_turns" }
 	| { type: "agent_end" };
@@ -80,6 +84,11 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 		history.push(message);
 		if (persist) onEvent({ type: "message_appended", message });
 	};
+
+	// 软路由：上次已声明的工具集（session 级——声明留在 transcript 里跨任务有效）
+	let lastDeclaredTools: string[] | null = config.getActiveTools
+		? config.getActiveTools().map((t) => t.name)
+		: null;
 
 	while (true) {
 		// —— 外层循环：一条用户输入开启一个任务 ——
@@ -147,6 +156,20 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 			}
 
 			turnsUsed++;
+
+			// 软路由的 declareToolChanges（对照 pi: agent-loop.ts:332）：
+			// 活跃工具集与上次声明有差分时，注入 system 消息告知模型。
+			// 首轮以当前集为基准（初始集由请求的 tools 参数自然携带）。
+			const activeTools = config.getActiveTools?.() ?? config.tools;
+			if (config.getActiveTools) {
+				const diff = diffToolSets(lastDeclaredTools, activeTools);
+				lastDeclaredTools = activeTools.map((t) => t.name);
+				if (diff) {
+					pushMessage({ role: "system", content: toolChangesMessage(diff) });
+					onEvent({ type: "tools_changed", added: diff.added, removed: diff.removed });
+				}
+			}
+
 			if (turnsUsed > maxTurns && !forceStop) {
 				// 达到上限：不再执行工具，给模型一次"纯总结"的机会
 				forceStop = true;
@@ -167,7 +190,7 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 					[{ role: "system", content: config.systemPrompt }, ...history],
 					currentModel,
 					// 只把 wire 层需要的字段给 ai 包（AgentTool 的 execute 不出 agent 包）
-					config.tools.map(({ name, description, parameters }) => ({ name, description, parameters })),
+					activeTools.map(({ name, description, parameters }) => ({ name, description, parameters })),
 					signal,
 				)) {
 					if (event.type === "text_delta") {
@@ -274,7 +297,7 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 						continue;
 					}
 
-					const tool = config.tools.find((t) => t.name === call.name);
+					const tool = activeTools.find((t) => t.name === call.name);
 					let content: string;
 					let isError = false;
 					if (!tool) {

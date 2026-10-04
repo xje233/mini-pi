@@ -473,3 +473,54 @@ src/main.ts                    # 底账接线、--resume、/compact、parseSessi
 测试套件的直接触发原因。
 
 ---
+
+## F11 · 工具路由系统（registry / expose-enforce / 软路由，2026-10-02~04）
+
+**做了什么**
+
+工具路由第一步（registry + expose/enforce 双层权限）与第二步（defer +
+search_tools 软路由 + declareToolChanges 差分声明）。调研依据见
+`docs/tool-routing-research.md`（Claude Code 双层权限 / Tool Search / pi 的
+loader tool 模式与 declareToolChanges 实证）。
+
+**代码结构**
+
+```
+docs/tool-routing-research.md # 调研存档（五步抽象 + Claude Code/pi 实证 + 设计修正）
+src/agent/tool-registry.ts    # registry（first-wins）+ matchToolPattern + 暴露过滤 + enforce 门
+src/agent/soft-routing.ts     # search_tools 元工具 + diffToolSets + 差分消息
+src/agent/tools.ts            # AgentTool 增加 domain/tags 元数据
+src/agent/agent-loop.ts       # beforeToolCall 钩子 + getActiveTools + declareToolChanges
+src/main.ts                   # DENY_TOOLS / ENFORCE_RULES / DEFER_TOOLS 环境变量接线
+```
+
+**关键设计决策（对照调研）**
+
+1. **权限拆双层**：expose（DENY_TOOLS 命中即从请求移除，模型看不见）+
+   enforce（ENFORCE_RULES 参数级 `argsRegex`，对照 `Bash(rm *)`）。
+   单层会把"可见但需批准"类工具错杀。
+2. **领域是元数据不是阶段**：`domain`/`tags` 供权限 glob（`shell:*`）与
+   软路由检索消费，不做硬分域阶段。
+3. **软路由选元工具路线**：`search_tools`（domain/关键词过滤，分词 OR 匹配）
+   而非向量召回——召回失败时模型可重试自救。
+4. **declareToolChanges**：活跃集差分 → `role:"system"` 消息入 transcript
+   （对照 pi 的结构化 toolsAdded/toolsRemoved，agent-loop.ts:332），
+   首轮以当前集为基准。
+5. **enforce 位置**：validate 之后、execute 之前；钩子抛错 = fail-safe 阻断。
+
+**排障记录**
+
+- 多词查询整句子串匹配必然落空（"运行命令 shell 时间" 不是 haystack 子串），
+  mock 用单词查询全绿、真机多词查询全挂——修复为分词 OR 语义。教训：
+  **检索类匹配必须用真实查询分布测试**（模型的查询天然是多词的）。
+- `grep | head` 提前关管道（EPIPE）杀掉被测进程，造成"无压缩条目"假象——
+  输出重定向文件再检查。
+- `.mjs` 测试里混入 TS 注解（`!`/`Array<>`/`(m: any)`）导致 SyntaxError——
+  测试文件保持纯 JS，或改名 `.ts`。
+
+**验证**：typecheck 通过；`npm test` 21 项全绿（含路由 8 项：registry/模式
+匹配/暴露过滤/参数级门控/循环集成/search_tools/差分/循环软路由集成）；
+真机端到端（ENFORCE_RULES 拦截 rm 且模型给出替代方案；DEFER_TOOLS 下模型
+search_tools 召回 run_command → `date` 获取真实系统时间，exit 0）。
+
+---

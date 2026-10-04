@@ -9,7 +9,8 @@ import type { ModelDef } from "./ai/models.js";
 import { agentLoop, type AgentState } from "./agent/agent-loop.js";
 import { DEFAULT_COMPACTION, type CompactionOptions } from "./agent/compaction.js";
 import { createTools } from "./agent/tools.js";
-import { createEnforceGate, filterVisibleTools, ToolRegistry, type DenyRule } from "./agent/tool-registry.js";
+import { createEnforceGate, filterVisibleTools, matchToolPattern, ToolRegistry, type DenyRule } from "./agent/tool-registry.js";
+import { createSearchToolsTool, type ToolSet } from "./agent/soft-routing.js";
 import { SessionManager, replaySession } from "./session/session-manager.js";
 
 /**
@@ -217,6 +218,21 @@ const enforceRules: DenyRule[] = (() => {
 })();
 if (enforceRules.length) console.log(`[enforce] 已加载 ${enforceRules.length} 条执行门控规则`);
 
+// —— 工具路由第二步：defer + search_tools 软路由（对照 Claude Code 的 Tool Search）——
+const deferPatterns = (process.env.DEFER_TOOLS ?? "")
+	.split(",")
+	.map((s) => s.trim())
+	.filter(Boolean);
+const deferredTools = visibleTools.filter((t) => deferPatterns.some((p) => matchToolPattern(p, t)));
+const softVisible = deferredTools.length
+	? visibleTools.filter((t) => !deferredTools.some((d) => d.name === t.name))
+	: visibleTools;
+const toolSet: ToolSet = { visible: softVisible };
+if (deferredTools.length) {
+	softVisible.push(createSearchToolsTool(toolSet, deferredTools));
+	console.log(`[defer] ${deferredTools.length} 个工具延迟加载，已暴露 search_tools 元工具（模式: ${deferPatterns.join(", ")}）`);
+}
+
 // 压缩设置（可变对象：/compact 置 force，循环层消费后复位；参数可用环境变量调小以便测试）
 const compaction: CompactionOptions = {
 	reserveTokens: Number(process.env.COMPACT_RESERVE_TOKENS ?? DEFAULT_COMPACTION.reserveTokens),
@@ -242,8 +258,9 @@ try {
 		{
 			systemPrompt,
 			streamFn: defaultStreamFn,
-			tools: visibleTools,
+			tools: softVisible,
 			state,
+			getActiveTools: () => toolSet.visible,
 			beforeToolCall: enforceRules.length ? createEnforceGate(enforceRules) : undefined,
 			maxTurns: Number(process.env.MAX_TURNS ?? 30),
 			getSignal: () => abortController?.signal,
@@ -324,6 +341,11 @@ try {
 				}
 				case "compaction_skipped":
 					console.log(`  🗜️  [compaction] 已跳过：${event.reason}`);
+					break;
+				case "tools_changed":
+					console.log(
+						`  🔧 [tools] +${event.added.join(", ")}${event.removed.length ? ` / -${event.removed.join(", ")}` : ""}`,
+					);
 					break;
 				case "limit_reached":
 					console.log(`\n⛔ 已达单任务最大工具轮次（${event.maxTurns}），进入强制收尾`);
