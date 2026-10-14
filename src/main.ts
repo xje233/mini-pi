@@ -2,6 +2,7 @@
 // 会话层：readline UI + 斜杠命令解析 + 打印。循环不感知这些（哑内核）。
 // 对照 pi：斜杠命令在会话层（slash-commands.ts）拦截，到不了 agent 循环。
 import readline from "node:readline";
+import { basename } from "node:path";
 import { defaultStreamFn } from "./ai/index.js";
 import type { ChatMessage } from "./ai/index.js";
 import { MODELS, listModels, resolveApiKey, resolveModel } from "./ai/models.js";
@@ -12,6 +13,9 @@ import { createTools } from "./agent/tools.js";
 import { createEnforceGate, filterVisibleTools, matchToolPattern, ToolRegistry, type DenyRule } from "./agent/tool-registry.js";
 import { createSearchToolsTool, type ToolSet } from "./agent/soft-routing.js";
 import { SessionManager, replaySession } from "./session/session-manager.js";
+import { TraceCollector } from "./telemetry/collector.js";
+import { TraceStore } from "./telemetry/store.js";
+import { buildSpanTree, formatAgo, formatSpanTree, listTraces } from "./telemetry/view.js";
 
 /**
  * 行队列（ERR-003）：readline/promises 的 question() 在第一次 resolve 后
@@ -116,6 +120,17 @@ if (resume) {
 	console.log(`已恢复会话 ${session.file}（${replayed.history.length} 条消息）`);
 }
 
+// —— L5 观测（Trace）：事件流旁路收集 + JSONL 落盘（docs/observability-research.md）——
+// trace 是诊断数据不是业务状态 → 与 session 底账分开存储；收集器整体吞错，绝不影响主流程。
+// 内容门控：默认只记长度/计数等元数据；MINI_PI_TRACE_CONTENT=1 才把正文写入 trace。
+const sessionId = basename(session.file, ".jsonl");
+const traceStore = new TraceStore(".mini-pi/traces", sessionId);
+const traceCollector = new TraceCollector({
+	sessionId,
+	sink: traceStore,
+	content: process.env.MINI_PI_TRACE_CONTENT === "1",
+});
+
 /** /model 命令：无参列出模型；带参切换，切换前做 auth 预检（失败不切换） */
 function handleModelCommand(arg: string): void {
 	if (!arg) {
@@ -141,6 +156,27 @@ function handleModelCommand(arg: string): void {
 	console.log(`[模型] ${state.model.provider}/${state.model.modelId}`);
 }
 
+/** /trace 命令：读落盘 span → 投影成树（默认最近一个任务；/trace 2 = 倒数第二个） */
+function handleTraceCommand(arg: string): void {
+	const spans = traceStore.readAll();
+	if (!spans.length) {
+		console.log("暂无 trace（完成一次任务后再试）");
+		return;
+	}
+	const traces = listTraces(spans);
+	const n = arg ? Number(arg) : 1;
+	if (!Number.isInteger(n) || n < 1 || n > traces.length) {
+		console.log(`用法: /trace [n]（1 = 最近），当前共 ${traces.length} 个任务`);
+		return;
+	}
+	const summary = traces[traces.length - n]!;
+	const roots = buildSpanTree(spans.filter((s) => s.traceId === summary.traceId));
+	console.log(
+		`[trace] 最近第 ${n}/${traces.length} 个任务 · ${summary.spanCount} spans · ${formatAgo(summary.startTime)}`,
+	);
+	console.log(formatSpanTree(roots));
+}
+
 console.log(`mini-pi 就绪 | 模型: ${state.model.provider}/${state.model.modelId}`);
 console.log(`可用模型:\n${listModels()}\n切换: /model <provider/model>，退出: exit`);
 
@@ -154,7 +190,9 @@ const rl = readline.createInterface({
 	terminal: process.stdin.isTTY,
 });
 
-console.log("提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止；/compact = 手动压缩；exit = 退出（--resume 可恢复上次会话）");
+console.log(
+	"提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止；/compact = 手动压缩；/trace = 查看最近任务 trace；exit = 退出（--resume 可恢复上次会话）",
+);
 
 /**
  * 会话行解析（忙碌/空闲两条路径共用——F9 排障：命令解析只在空闲路径做时，
@@ -172,6 +210,10 @@ function parseSessionLine(line: string): { quit: boolean; messages: ChatMessage[
 	}
 	if (trimmed.startsWith("/model")) {
 		handleModelCommand(trimmed.slice("/model".length).trim());
+		return { quit: false, messages: [] };
+	}
+	if (trimmed === "/trace" || trimmed.startsWith("/trace ")) {
+		handleTraceCommand(trimmed.slice("/trace".length).trim());
 		return { quit: false, messages: [] };
 	}
 	return { quit: false, messages: [{ role: "user", content: line }] };
@@ -291,6 +333,8 @@ try {
 			},
 		},
 		(event) => {
+			// L5 观测：纯旁路收集（内部吞错，不影响 UI 与循环）
+			traceCollector.onEvent(event);
 			switch (event.type) {
 				case "turn_start":
 					busy = true;

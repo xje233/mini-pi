@@ -524,3 +524,76 @@ src/main.ts                   # DENY_TOOLS / ENFORCE_RULES / DEFER_TOOLS 环境�
 search_tools 召回 run_command → `date` 获取真实系统时间，exit 0）。
 
 ---
+
+## F12 · L5 观测第一步：事件流重建 span + /trace（2026-10-05）
+
+**做了什么**
+
+架构图 L5 的 Trace 底座：观测器旁听 AgentEvent 事件流，把"散的事件"配对成
+span（括号），append-only JSONL 落盘（`.mini-pi/traces/`，每 session 一个文件），
+`/trace` 在读取时按 parentSpanId 投影成树展示。内核零改动——这是 F1"哑内核 +
+事件流"设计的直接红利（调研依据：docs/observability-research.md）。
+
+**代码结构**
+
+```
+src/telemetry/types.ts     # SpanRecord/SpanEventRecord/SpanNode（pi callback 契约的"快照化"裁剪）
+src/telemetry/collector.ts # TraceCollector：AgentEvent → span 状态机（重建核心）
+src/telemetry/store.ts     # TraceStore：append-only JSONL + 逐行容错读取
+src/telemetry/view.ts      # buildSpanTree/listTraces/formatSpanTree（读取时投影）
+src/main.ts                # onEvent 旁路接线 + /trace 命令（会话层）
+tests/trace.test.mjs       # 事件脚本 → span 树断言（18 项）
+```
+
+**关键设计决策（对照 pi / Codex / Claude Code / OTel semconv）**
+
+1. **事件流重建 ≠ 主动插桩**：pi 用 callback 式 startSpan 在每个调用点手动开
+   span（契约完备但全仓库只插桩了 1 个）；mini-pi 不碰内核，collector 维护
+   "打开中的 span 栈"，按事件进出配对。代价是只能到事件粒度；收益是零侵入，
+   覆盖面天然更全（turn/chat/tool/压缩都在事件流里）。
+2. **LLM 结算锚点 = assistant 的 message_appended**（不是 message_end）：
+   后者只在模型有文本输出时才发（agent-loop.ts:227）；而工具批次内的
+   start/end 之间绝不会插入该事件，所以它是"一次 LLM 请求结束"的无歧义
+   锚点，还顺带解决了"模型不发言直接调工具"轮次的 chat span 回补——真机
+   4 轮 LLM 里 2 轮是这种情况，全靠它记录。
+3. **请求窗口近似**：LLM 请求"发出时刻"没有事件，用"上一个活动时刻"回溯
+   （Node 单线程同步派发，循环紧接着发起请求，误差毫秒级）。语义对齐 OTel：
+   chat span 覆盖一次逻辑请求（含重试），TTFT 是 span 属性
+   （gen_ai.response.time_to_first_chunk 的对应物）。
+4. **数据模型是"已结算快照"**：pi 的契约是运行时句柄（startSpan 回调拥有生命
+   周期）；重建路线不需要句柄——SpanRecord 就是结算后的一行记录，树不在存储
+   里，读取时按 parentSpanId 聚（对照 Codex rollout：单文件线性 JSONL，无
+   event 树，replay 靠物理行序）。
+5. **traceId 用 base36 时刻而非序号**：纯序号在 --resume 的新进程里从 0 重来，
+   两个任务的 traceId 会撞名（同一文件里出现两个 t1，/trace 会把它们合并）；
+   根 span 的 id 换成起始时刻 base36 后跨进程唯一（测试 3c 锁住这个行为）。
+6. **内容门控默认脱敏**：默认只记长度/计数（input_chars/args_chars）；设
+   `MINI_PI_TRACE_CONTENT=1` 才把正文写入（截断 200 字符）。对照 Claude Code
+   的 OTEL_LOG_* 六门控与 semconv 的 opt-in content——内容捕获是数据分级
+   决策，不是调试开关。
+7. **旁路原则写进代码**：collector.onEvent 整体吞错；sink 落盘失败静默一次
+   （对照 pi adapter 契约的 "suppress backend failures"）——观测失败绝不影响
+   主流程。
+8. **compaction/steering/tools_changed/limit_reached 记成 turn span 上的
+   event**：这些没有可靠的 start 时刻，不假装有 span（OTel 里 event 就是
+   时间点事实）。
+9. **存储分离**：trace 与 session 底账分开存储（diagnostic data ≠ business
+   state，pi telemetry README 的第一原则）；文件名与会话文件同名
+   （`<sessionId>.jsonl`），resume 后仍能对上。
+
+**验证**
+
+- typecheck 通过；`npm test` 全绿（新增 trace 18 项：完整任务重建/abort 路径/
+  落盘 roundtrip/坏行容错/跨进程 traceId 不撞名/内容门控/无 start 的 end 防御/
+  sink 抛错旁路/格式化输出）。
+- 真机端到端：任务"创建→读回→删除文件"→ 9 spans 全部正确重建——4 轮 LLM
+  的 chat span（含 2 个无文本轮回补、ttft 657ms/501ms）与 4 个工具 span
+  （write 1ms / list 0ms / read 2ms / run_command 876ms）完整配对；
+  `--resume` 后 `/trace` 跨进程正常渲染出树。
+
+**未尽事项**（L5 后续）：护栏审计（tool_decision 式决策事件，L5-B）、eval
+harness（L5-C）、压缩的摘要 LLM 调用没有 span（无事件，只有 compaction
+event）、span 树目前两层（子 agent/并行工具需要更深）、OTLP adapter
+（契约留了 TraceSink 口子，未做）。
+
+---
