@@ -11,6 +11,7 @@
 // getUserMessage 返回 null 才是循环认识的退出信号。
 import type { AssistantReply, ChatMessage, StreamFn, ToolCall } from "../ai/index.js";
 import type { ModelDef } from "../ai/models.js";
+import type { DecisionSource, ToolCallDecision } from "./decision.js";
 import type { AgentTool } from "./tools.js";
 import { validateToolArguments } from "./validation.js";
 import { compactHistory, estimateTokens, shouldCompact, summaryMessage, type CompactionOptions } from "./compaction.js";
@@ -36,11 +37,12 @@ export interface AgentLoopConfig {
 	maxTurns?: number;
 	// 执行门控钩子（对照 pi 的 beforeToolCall）：在 validate 之后、execute 之前
 	// 运行，可 block（fail-safe：钩子抛错也视为 block）。返回 undefined = 放行。
+	// 裁决带 source/rule 归因（L5-B 审计：区分"规则拦的"与"钩子坏了的"）。
 	beforeToolCall?: (input: {
 		toolCall: ToolCall;
 		tool: AgentTool;
 		args: Record<string, unknown>;
-	}) => Promise<{ block?: boolean; reason?: string } | undefined> | { block?: boolean; reason?: string } | undefined;
+	}) => Promise<ToolCallDecision | undefined> | ToolCallDecision | undefined;
 	// 软路由：取当前活跃工具集（可被 search_tools 原地修改）。缺省 = config.tools 静态集
 	getActiveTools?: () => AgentTool[];
 	// 恢复会话时带入的历史（投影后，来自 SessionManager 重放）
@@ -62,6 +64,18 @@ export type AgentEvent =
 	| { type: "compaction_applied"; summary: string; tokensBefore: number; keptMessages: ChatMessage[] }
 	| { type: "compaction_skipped"; reason: string }
 	| { type: "tools_changed"; added: string[]; removed: string[] }
+	// L5-B 审计：每次权限决策都是事实。argsChars 恒有；argsPreview 供内容门控消费
+	// （默认审计只落长度，MINI_PI_TRACE_CONTENT=1 才落参数正文）。
+	| {
+			type: "tool_decision";
+			tool: string;
+			decision: "allow" | "deny";
+			source: DecisionSource;
+			rule?: string;
+			reason?: string;
+			argsChars: number;
+			argsPreview: string;
+	  }
 	| { type: "limit_reached"; maxTurns: number }
 	| { type: "turn_end"; reason: "completed" | "aborted" | "max_turns" }
 	| { type: "agent_end" };
@@ -298,7 +312,8 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 					}
 
 					const tool = activeTools.find((t) => t.name === call.name);
-					let content: string;
+					// 初始化空串只为满足 TS 控制流分析：下面每条路径都会覆盖它
+					let content = "";
 					let isError = false;
 					if (!tool) {
 						content = `未知工具: ${call.name}`;
@@ -314,17 +329,55 @@ export async function agentLoop(config: AgentLoopConfig, onEvent: (event: AgentE
 								content = validation.message;
 								isError = true;
 							} else {
-								// 执行门控：validate 之后、execute 之前（对照 pi 的顺序）；
-								// 钩子抛错走外层 catch → isError 回填 = fail-safe 阻断
-								const verdict = config.beforeToolCall
-									? await config.beforeToolCall({ toolCall: call, tool, args: validation.args })
-									: undefined;
-								if (verdict?.block) {
-									content = verdict.reason ?? "工具调用被权限规则拒绝";
-									isError = true;
-								} else {
-									content = await tool.execute(validation.args, signal);
+								// 执行门控：validate 之后、execute 之前（对照 pi 的顺序）。
+								// L5-B：决策本身是审计事实——放行/拒绝都发 tool_decision；
+								// 钩子抛错必须与"工具自己失败"区分，所以单独 try/catch（fail-safe 阻断）。
+								const decisionBase = {
+									tool: call.name,
+									argsChars: call.arguments.length,
+									argsPreview: call.arguments.slice(0, 200),
+								};
+								let blocked = false;
+								if (config.beforeToolCall) {
+									try {
+										const verdict = await config.beforeToolCall({ toolCall: call, tool, args: validation.args });
+										if (verdict?.block) {
+											blocked = true;
+											content = verdict.reason ?? "工具调用被权限规则拒绝";
+											isError = true;
+											onEvent({
+												type: "tool_decision",
+												...decisionBase,
+												decision: "deny",
+												source: verdict.source ?? "rule",
+												...(verdict.rule ? { rule: verdict.rule } : {}),
+												reason: content,
+											});
+										} else {
+											// 放行也带归因：审批门放行时 source 是 user_temporary/user_permanent，
+											// 无策略时才是 default（审计据此区分"人工批准"与"自动放行"）
+											onEvent({
+												type: "tool_decision",
+												...decisionBase,
+												decision: "allow",
+												source: verdict?.source ?? "default",
+												...(verdict?.rule ? { rule: verdict.rule } : {}),
+											});
+										}
+									} catch (err) {
+										blocked = true;
+										content = `Error: 权限钩子异常，已按 fail-safe 阻断: ${err instanceof Error ? err.message : String(err)}`;
+										isError = true;
+										onEvent({
+											type: "tool_decision",
+											...decisionBase,
+											decision: "deny",
+											source: "hook",
+											reason: content,
+										});
+									}
 								}
+								if (!blocked) content = await tool.execute(validation.args, signal);
 							}
 						} catch (err) {
 							// 错误不抛出——以 isError 结果回填，让模型自己看到并修正（pi 的错误哲学）

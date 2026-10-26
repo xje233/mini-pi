@@ -88,6 +88,7 @@ function describe(node: SpanNode): string {
 	if (typeof attrs.output_chars === "number") parts.push(`out ${attrs.output_chars} 字`);
 	if (typeof attrs.tool_calls === "number" && attrs.tool_calls > 0) parts.push(`→ ${attrs.tool_calls} 个工具调用`);
 	if (attrs.is_error === true) parts.push("失败");
+	if (attrs.decision === "deny") parts.push(`[拦截:${typeof attrs.decision_source === "string" ? attrs.decision_source : "?"}]`);
 	if (typeof attrs.reason === "string" && attrs.reason !== "completed") parts.push(`(${attrs.reason})`);
 	parts.push(formatDuration(node.endTime - node.startTime));
 	parts.push(node.status === "error" ? "✗" : "✓");

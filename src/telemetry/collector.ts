@@ -64,6 +64,11 @@ export class TraceCollector {
 		return this.spans;
 	}
 
+	/** 当前任务的 trace id（无任务进行中时 null；供审计记录关联） */
+	currentTraceId(): string | null {
+		return this.openTurn?.traceId ?? null;
+	}
+
 	/** AgentEvent → span 状态机（同步）。整体吞错 = 旁路原则：观测失败不影响主流程 */
 	onEvent(event: AgentEvent): void {
 		const now = this.clock();
@@ -126,6 +131,23 @@ export class TraceCollector {
 					this.close(top, now, event.isError ? "error" : "ok");
 				}
 				// 无对应 start 的 end：忽略（不造脏 span）
+				break;
+			}
+			case "tool_decision": {
+				// 只把"拦截"写进 trace（allow 是默认路径，写进去只会淹没信号；
+				// 需要全量放行审计时由 AuditLogger 的 AUDIT_ALLOW 负责，职责分离）
+				if (event.decision !== "deny") break;
+				const top = this.open.at(-1);
+				if (top?.name === "execute_tool" && top.attributes.tool === event.tool) {
+					top.attributes.decision = "deny";
+					top.attributes.decision_source = event.source;
+					if (event.rule) top.attributes.rule = event.rule;
+				}
+				this.addTurnEvent("tool_decision", now, {
+					tool: event.tool,
+					source: event.source,
+					...(event.rule ? { rule: event.rule } : {}),
+				});
 				break;
 			}
 			case "steering_applied":

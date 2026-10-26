@@ -10,12 +10,22 @@ import type { ModelDef } from "./ai/models.js";
 import { agentLoop, type AgentState } from "./agent/agent-loop.js";
 import { DEFAULT_COMPACTION, type CompactionOptions } from "./agent/compaction.js";
 import { createTools } from "./agent/tools.js";
-import { createEnforceGate, filterVisibleTools, matchToolPattern, ToolRegistry, type DenyRule } from "./agent/tool-registry.js";
+import {
+	composeGates,
+	createApprovalGate,
+	createEnforceGate,
+	filterVisibleTools,
+	matchToolPattern,
+	ToolRegistry,
+	type ApprovalAnswer,
+	type DenyRule,
+} from "./agent/tool-registry.js";
 import { createSearchToolsTool, type ToolSet } from "./agent/soft-routing.js";
 import { SessionManager, replaySession } from "./session/session-manager.js";
 import { TraceCollector } from "./telemetry/collector.js";
 import { TraceStore } from "./telemetry/store.js";
 import { buildSpanTree, formatAgo, formatSpanTree, listTraces } from "./telemetry/view.js";
+import { AuditLogger, AuditStore, formatDecision } from "./telemetry/audit.js";
 
 /**
  * 行队列（ERR-003）：readline/promises 的 question() 在第一次 resolve 后
@@ -131,6 +141,17 @@ const traceCollector = new TraceCollector({
 	content: process.env.MINI_PI_TRACE_CONTENT === "1",
 });
 
+// —— L5 观测（护栏审计）：每次权限决策的账本（对照 Claude Code 的 tool_decision）——
+// 与 trace 分文件：审计要求全量/长期保留/跨会话可查。默认只记拦截（降噪）；
+// AUDIT_ALLOW=1 记录放行（生产合规应全量）。内容门控与 trace 共用同一开关。
+const auditStore = new AuditStore(".mini-pi/audit", sessionId);
+const auditLogger = new AuditLogger(auditStore, {
+	sessionId,
+	content: process.env.MINI_PI_TRACE_CONTENT === "1",
+	recordAllow: process.env.AUDIT_ALLOW === "1",
+	getTraceId: () => traceCollector.currentTraceId(),
+});
+
 /** /model 命令：无参列出模型；带参切换，切换前做 auth 预检（失败不切换） */
 function handleModelCommand(arg: string): void {
 	if (!arg) {
@@ -177,6 +198,19 @@ function handleTraceCommand(arg: string): void {
 	console.log(formatSpanTree(roots));
 }
 
+/** /audit 命令：列出本会话的权限决策（默认最近 20 条，倒序） */
+function handleAuditCommand(arg: string): void {
+	const records = auditStore.readAll();
+	if (!records.length) {
+		console.log("暂无审计记录（DENY_TOOLS 隐藏、ENFORCE_RULES 拦截、钩子异常、AUDIT_ALLOW=1 放行时会记录）");
+		return;
+	}
+	const limit = Math.max(1, Number(arg) || 20);
+	const shown = records.slice(-limit).reverse();
+	console.log(`[audit] 共 ${records.length} 条，展示最近 ${shown.length} 条：`);
+	for (const record of shown) console.log(formatDecision(record));
+}
+
 console.log(`mini-pi 就绪 | 模型: ${state.model.provider}/${state.model.modelId}`);
 console.log(`可用模型:\n${listModels()}\n切换: /model <provider/model>，退出: exit`);
 
@@ -191,7 +225,7 @@ const rl = readline.createInterface({
 });
 
 console.log(
-	"提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止；/compact = 手动压缩；/trace = 查看最近任务 trace；exit = 退出（--resume 可恢复上次会话）",
+	"提示：执行期间输入消息 = steering（回合边界生效）；/stop = 立即中止；/compact = 手动压缩；/trace = 查看任务 trace；/audit = 查看权限决策；exit = 退出（--resume 可恢复上次会话）",
 );
 
 /**
@@ -214,6 +248,10 @@ function parseSessionLine(line: string): { quit: boolean; messages: ChatMessage[
 	}
 	if (trimmed === "/trace" || trimmed.startsWith("/trace ")) {
 		handleTraceCommand(trimmed.slice("/trace".length).trim());
+		return { quit: false, messages: [] };
+	}
+	if (trimmed === "/audit" || trimmed.startsWith("/audit ")) {
+		handleAuditCommand(trimmed.slice("/audit".length).trim());
 		return { quit: false, messages: [] };
 	}
 	return { quit: false, messages: [{ role: "user", content: line }] };
@@ -243,6 +281,20 @@ if (denyPatterns.length) {
 	const hidden = registry.all().length - visibleTools.length;
 	console.log(`[expose] 已按 DENY_TOOLS 隐藏 ${hidden} 个工具（模式: ${denyPatterns.join(", ")}）`);
 }
+// L5-B：暴露层隐藏是最隐蔽的一类拦截（模型根本看不见，永远不会产生调用/拒绝事件），
+// 必须在启动时留审计，否则事后无法解释"为什么 agent 从不使用某能力"。
+for (const tool of registry.all()) {
+	if (visibleTools.some((v) => v.name === tool.name)) continue;
+	auditStore.append({
+		sessionId,
+		timestamp: Date.now(),
+		traceId: null,
+		tool: tool.name,
+		decision: "deny",
+		source: "config",
+		reason: `DENY_TOOLS 隐藏（模型不可见）：${denyPatterns.join(", ")}`,
+	});
+}
 
 // ③ 执行门控：ENFORCE_RULES 为 JSON 数组 [{ "tool": "run_command", "argsRegex": "\\brm\\b", "reason": "..." }]
 //    argsRegex 对参数 JSON 串匹配（对照 Claude Code 的 Bash(rm *) 参数级模式）
@@ -259,6 +311,15 @@ const enforceRules: DenyRule[] = (() => {
 	}
 })();
 if (enforceRules.length) console.log(`[enforce] 已加载 ${enforceRules.length} 条执行门控规则`);
+
+// —— L5-B：交互式审批（ASK_TOOLS 命中时在 execute 前询问；对照 Claude Code 的 user_* 决策源）——
+const askPatterns = (process.env.ASK_TOOLS ?? "")
+	.split(",")
+	.map((s) => s.trim())
+	.filter(Boolean);
+if (askPatterns.length) {
+	console.log(`[approval] ${askPatterns.length} 个模式命中时需人工审批（模式: ${askPatterns.join(", ")}）`);
+}
 
 // —— 工具路由第二步：defer + search_tools 软路由（对照 Claude Code 的 Tool Search）——
 const deferPatterns = (process.env.DEFER_TOOLS ?? "")
@@ -281,13 +342,65 @@ const compaction: CompactionOptions = {
 	keepRecentTokens: Number(process.env.COMPACT_KEEP_RECENT_TOKENS ?? DEFAULT_COMPACTION.keepRecentTokens),
 };
 
+// —— 交互式审批的会话层实现：复用 LineQueue 的行通道（内核不感知 stdin）——
+// 审批提示出现后的下一行即答案；提示出现前缓冲的行仍是 steering（两种语义不混）。
+let pendingApproval: { resolve: (answer: string) => void } | null = null;
+
+function resolveApproval(answer: string): void {
+	const pending = pendingApproval;
+	pendingApproval = null;
+	pending?.resolve(answer);
+}
+
+/** 向用户提问并等待一行输入（y=本次 / a=本会话总是 / n=拒绝） */
+function requestApproval(request: { tool: string; argsPreview: string }): Promise<ApprovalAnswer> {
+	process.stdout.write(`\n[审批] ${request.tool} ${request.argsPreview}\n  允许？(y=本次 / a=本会话总是 / n=拒绝): `);
+	return new Promise<string>((resolve) => {
+		pendingApproval = { resolve };
+	}).then((answer) => {
+		const normalized = answer.trim().toLowerCase();
+		if (normalized === "y" || normalized === "yes") {
+			console.log("  已批准（本次）");
+			return "yes";
+		}
+		if (normalized === "a" || normalized === "always") {
+			console.log("  已批准（本会话总是）");
+			return "always";
+		}
+		if (normalized === "abort") {
+			console.log("  已中止");
+			return "abort";
+		}
+		console.log("  已拒绝");
+		return "no";
+	});
+}
+
+const approvalGate = askPatterns.length
+	? createApprovalGate({ patterns: askPatterns, requestApproval })
+	: undefined;
+
+// EOF/关闭时唤醒等待中的审批：未作答 = 拒绝（对照 Claude Code 的 user_abort，fail-closed）
+rl.on("close", () => resolveApproval("abort"));
+
 const lines = new LineQueue(rl, (line) => {
-	// busy 时的行处理：/stop 立即 abort（独立通道）；exit 软退出；/compact 即时排程；
-	// 其余返回 false 进入缓冲作为 steering 消息
+	// busy 时的行处理：/stop 立即 abort（独立通道）；审批等待期间的行是审批答案；
+	// exit 软退出；/compact 即时排程；其余返回 false 进入缓冲作为 steering 消息
 	if (!busy) return false;
 	const trimmed = line.trim();
 	if (trimmed === "/stop") {
 		abortController?.abort();
+		resolveApproval("abort"); // 唤醒等待中的审批（fail-closed）
+		return true;
+	}
+	if (pendingApproval) {
+		if (trimmed === "exit") {
+			quitRequested = true;
+			abortController?.abort();
+			resolveApproval("abort");
+			return true;
+		}
+		resolveApproval(trimmed);
 		return true;
 	}
 	const parsed = parseSessionLine(line);
@@ -303,7 +416,11 @@ try {
 			tools: softVisible,
 			state,
 			getActiveTools: () => toolSet.visible,
-			beforeToolCall: enforceRules.length ? createEnforceGate(enforceRules) : undefined,
+			// 多层门控组合：硬规则优先，其次审批；任一 block 即拒绝（归因随裁决透传）
+			beforeToolCall: composeGates([
+				enforceRules.length ? createEnforceGate(enforceRules) : undefined,
+				approvalGate,
+			]),
 			maxTurns: Number(process.env.MAX_TURNS ?? 30),
 			getSignal: () => abortController?.signal,
 			initialHistory: resumedHistory,
@@ -335,6 +452,7 @@ try {
 		(event) => {
 			// L5 观测：纯旁路收集（内部吞错，不影响 UI 与循环）
 			traceCollector.onEvent(event);
+			auditLogger.onEvent(event);
 			switch (event.type) {
 				case "turn_start":
 					busy = true;

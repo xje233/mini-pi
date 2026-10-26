@@ -597,3 +597,116 @@ event）、span 树目前两层（子 agent/并行工具需要更深）、OTLP a
 （契约留了 TraceSink 口子，未做）。
 
 ---
+
+## F13 · L5 观测第二步：护栏审计（tool_decision）（2026-10-25）
+
+**做了什么**
+
+把 F11 的"拦"补齐成"可审计的拦"：内核在权限决策点发出 `tool_decision` 事件
+（放行/拒绝都陈述事实），审计账本落 `.mini-pi/audit/`，`/audit` 可查；
+trace 侧把拦截写进 tool span（树里显示 `[拦截:rule]`）与 turn event；
+启动期 `DENY_TOOLS` 隐藏也留痕（最隐蔽的一类拦截）。
+
+**代码结构**
+
+```
+src/agent/agent-loop.ts    # ToolCallDecision 归因类型 + tool_decision 事件 +
+                           #   beforeToolCall 独立 try/catch（钩子异常 ≠ 工具失败）
+src/agent/tool-registry.ts # EnforceVerdict 带 source/rule；gate 返回审计证据
+src/telemetry/audit.ts     # DecisionRecord + AuditStore + AuditLogger + formatDecision
+src/telemetry/collector.ts # tool_decision → tool span 属性 + turn event；currentTraceId()
+src/telemetry/view.ts      # 树里展示 [拦截:source]
+src/main.ts                # 审计接线 + expose 留痕 + /audit 命令
+tests/audit.test.mjs       # 9 项断言
+```
+
+**关键设计决策（对照 Claude Code / pi / Codex）**
+
+1. **决策由内核在决策点发出，不从 isError 反推**：从执行结果分不清"工具自己失败"
+   与"被规则拦截"，且 expose 隐藏根本不产生执行事件。内核只陈述事实（decision +
+   source + rule + 参数摘要），落盘粒度由消费方决定——"哑内核 + 事件流"的又一次应用。
+2. **归因（source）是审计的灵魂**：`config`（暴露层隐藏）/ `rule`（规则命中）/
+   `hook`（钩子决策或异常）/ `default`（无策略放行），对照 Claude Code
+   tool_decision 的六态归因。钩子抛错必须与规则拦截分开——一个是"策略拦的"，
+   一个是"策略坏了"，修复方向完全不同（fail-safe 也要可审计）。
+3. **审计与 trace 分文件**：`.mini-pi/audit/` vs `.mini-pi/traces/`——trace 是
+   诊断数据（可采样，回答"慢在哪"），审计是证据账本（deny 全量、跨会话可查，
+   回答"谁为什么放行/拦截"）。同一次决策两处都写，但职责不同。
+4. **allow 默认不记，`AUDIT_ALLOW=1` 全量**：生产合规应全量记录，教学默认降噪
+   （否则每个工具调用一条，账本被淹没）。这个开关本身就是"审计粒度是策略"的演示。
+5. **内容门控与 trace 共用 `MINI_PI_TRACE_CONTENT`**：默认只记 `argsChars`
+   （长度）；开启后记 `argsPreview`（截断 200）。对照 Claude Code 的
+   OTEL_LOG_TOOL_DETAILS——被拒命令的内容恰恰是审计要看的，但要显式开启。
+6. **expose 隐藏必须在启动时留痕**：模型看不见的工具永远不会产生调用/拒绝事件，
+   不记就等于"这个能力从未存在过"，事后无法解释 agent 为什么从不用某能力。
+7. **审计写失败吞掉**：旁路原则（与 TraceCollector 同款），审计坏了不阻塞 agent。
+
+**验证**
+
+- typecheck 通过；`npm test` 全绿（新增 audit 9 项：规则拦截/钩子异常/放行/
+  gate 归因/store 坏行容错/allow 开关/内容门控/格式化 + trace 接入）。
+- 真机端到端：`ENFORCE_RULES` 拦截 `rm -rf` → 模型收到"禁止 rm"并如实报告；
+  `--resume` 后 `/audit` 显示两条（rule 拦截 + expose 隐藏，含 traceId 关联），
+  `/trace` 里 tool span 标 `[拦截:rule]`、turn 带 `[tool_decision]` event。
+
+**未尽事项**：交互式审批（`confirm` / user_temporary，对照 Claude Code 的
+user_permanent/user_abort 与"未作答即拒绝"）未做——当前只有"自动放行/自动拒绝"
+两态；审计的跨会话聚合查询（按工具/规则统计）未做；eval（L5-C）未开始。
+
+---
+
+## F14 · L5 观测第三步：交互式审批（2026-10-26）
+
+**做了什么**
+
+`ASK_TOOLS` 命中的工具调用在 execute 前暂停询问：`y`=本次允许、`a`=本会话总是、
+`n`=拒绝、EOF/中止=未作答（fail-closed）。审批复用 LineQueue 的行通道（不新开
+stdin 读取），结果以 `user_*` 归因写入审计；多层门控组合（硬规则优先，其次审批）。
+
+**代码结构**
+
+```
+src/agent/decision.ts      # DecisionSource 8 态 + ToolCallDecision（内核/门控/审计共享）
+src/agent/tool-registry.ts # createApprovalGate（y/a/n/abort + always 集合）+ composeGates
+src/agent/agent-loop.ts    # allow 事件透传裁决归因（user_temporary 不再被吞成 default）
+src/telemetry/audit.ts     # 人工批准必留痕（自动放行仍按 AUDIT_ALLOW 控制）
+src/main.ts                # ASK_TOOLS + requestApproval + onLine 审批分支 + EOF fail-closed
+tests/approval.test.mjs    # 6 项断言
+```
+
+**关键设计决策（对照 Claude Code / pi）**
+
+1. **审批在会话层，内核只收裁决**：`beforeToolCall` 是纯函数钩子，`requestApproval`
+   由 main.ts 注入——内核不感知 stdin（哑内核原则）。pi 的扩展审批也是这个分工：
+   扩展自己实现 `ctx.ui.confirm`，agent 内核只认 block 裁决。
+2. **复用 LineQueue 的行通道，不新开 readline**：审批提示出现后的下一行即答案；
+   提示出现前缓冲的行仍是 steering——两种语义不混。这是 F6 行队列设计的复用，
+   而不是引入第二个 stdin 读取器（两个消费者会互相抢行）。
+3. **四种人工决策源对照 Claude Code**：`y`=user_temporary、`a`=user_permanent
+   （本会话记住，不落盘——比 Claude Code 的"保存规则"弱一档）、`n`=user_reject、
+   EOF/中止=user_abort（未作答按拒绝处理）。空行/无效输入也归 user_reject。
+4. **审批放行不能丢归因**：`composeGates` 透传最后一个非 block 裁决，否则
+   agent-loop 的 allow 事件会把 user_temporary 覆盖成 default，审计就丢了
+   "这是人批准的"这一最关键的信息。
+5. **人工批准必留痕**：审计的 allow 过滤从"默认不记"细化为"只过滤 default"——
+   自动放行可降噪，人批准的决策必须记录（审计价值最高的一类）。
+6. **审批期间的特殊命令**：`/stop` 立即 abort 并唤醒审批（fail-closed）；`exit`
+   置 quitRequested + abort；EOF 由 rl close 唤醒。任何路径都不会让审批永久挂起。
+7. **观测口径的已知偏差**：审批等待时间目前计入 tool span 的耗时（真机拒绝用例
+   8.73s = 用户思考时间）。对照 Claude Code 的 `tool.blocked_on_user` 子 span，
+   未来可把"等人"与"执行"拆开——这也是 L5 观测价值的体现：人机协作的延迟
+   也应该被看见。
+
+**验证**
+
+- typecheck 通过；`npm test` 全绿（新增 approval 6 项：命中询问/四态语义/
+  always 记忆/门控组合/内核归因透传/审计留痕）。
+- 真机端到端：`ASK_TOOLS=run_command`，任务执行 `date` → 暂停询问 →
+  `y` 批准后执行成功；`n` 拒绝后模型如实报告；`--resume` 后 `/audit` 显示
+  `[user_reject]`、`/trace` 显示 `[拦截:user_reject]`（tool span 耗时 8.73s
+  含人工等待时间）。
+
+**未尽事项**：审批等待未拆成独立 span（见决策 7）；`always` 不落盘（进程级）；
+审批 UI 未做"查看完整参数"（argsPreview 截断 200）；L5-C eval 未开始。
+
+---
