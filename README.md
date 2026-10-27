@@ -7,14 +7,14 @@ agent 的工程实现方式。
 可观测性（trace）……每一层能力都亲手实现，每个关键设计决策都对照生产实现
 （pi / Claude Code / Codex / OTel semconv）记录取舍与出处，并做真机端到端验证。
 
-- 约 2100 行 TypeScript（`src/`），内核零 UI / 零框架依赖（唯一运行时依赖是
+- 约 2900 行 TypeScript（`src/`），内核零 UI / 零框架依赖（唯一运行时依赖是
   `@sinclair/typebox`，用于工具参数 schema）
-- 7 个确定性测试文件（`npm test` 全绿）+ `tsc --noEmit` 类型检查
+- 9 个确定性测试文件（`npm test` 全绿）+ 确定性 eval 套件（`npm run eval`）+ `tsc --noEmit` 类型检查
 - 每层实现日志见 [DEVLOG.md](./DEVLOG.md)；故障复盘见 [ERRORS.md](./ERRORS.md)
 
 ## 能力总览
 
-按实现顺序排列（对应 [DEVLOG.md](./DEVLOG.md) 的 F1–F12）：
+按实现顺序排列（对应 [DEVLOG.md](./DEVLOG.md) 的 F1–F15）：
 
 | # | 能力 | 要点 |
 |---|------|------|
@@ -30,6 +30,9 @@ agent 的工程实现方式。
 | F10 | 质量 | 以 DEVLOG 行为为基准的代码审查（修复 2 个高危缺陷）+ 项目内回归测试套件 |
 | F11 | 工具路由 | `ToolRegistry` + `DENY_TOOLS`（暴露过滤）/ `ENFORCE_RULES`（参数级执行门控）双层权限 + `search_tools` 软路由 |
 | F12 | 可观测性 | 旁听事件流重建 span → JSONL 落盘 → `/trace` 树展示；默认脱敏，内容门控 opt-in |
+| F13 | 护栏审计 | `tool_decision` 事件（source 归因：config/rule/hook/user_*）→ JSONL 审计账本 + `/audit`；暴露层隐藏启动留痕 |
+| F14 | 交互式审批 | `ASK_TOOLS` 命中时暂停询问（y/a/n），EOF/中止 fail-closed；人工决策归因入审计 |
+| F15 | Eval | 脚本化模型 + 真实工具 + trace 断言的确定性 eval 套件；基线对比，失败 exit 1 |
 
 ## 快速开始
 
@@ -69,6 +72,7 @@ npm start -- --resume        # 恢复上次会话（-- 之后是脚本参数）
 | `/compact` | 手动排程上下文压缩（下一次 LLM 请求前执行） |
 | `/stop` | 立即中止当前任务（流式输出与工具执行同时中断） |
 | `/trace` | 查看最近任务的 trace 树（带 ttft、耗时、事件标注） |
+| `/audit` | 查看权限决策审计（拦截/放行归因、规则证据、trace 关联） |
 | `exit` | 退出（`--resume` 可恢复会话） |
 
 执行期间输入普通文本 = steering（缓存在队列、回合边界注入）；输入 `exit` = 当前回合结束后退出。
@@ -90,16 +94,18 @@ npm start -- --resume        # 恢复上次会话（-- 之后是脚本参数）
 | `DENY_TOOLS` | 暴露过滤：命中的工具从请求中移除，模型看不见（逗号分隔，`shell:*` 形式） |
 | `DEFER_TOOLS` | 软路由：命中的工具延迟加载，模型经 `search_tools` 按需召回 |
 | `ENFORCE_RULES` | 执行门控：参数级 `argsRegex` 规则（如禁 `rm`） |
+| `ASK_TOOLS` | 交互审批：命中的工具在执行前询问（y=本次 / a=本会话总是 / n=拒绝） |
 | `SYSTEM_PROMPT` | 覆盖默认 system prompt |
-| `MINI_PI_TRACE_CONTENT` | 置 1 时 trace 记录正文（截断 200 字符）；默认只记长度/计数 |
+| `MINI_PI_TRACE_CONTENT` | 置 1 时 trace/audit 记录正文（截断 200 字符）；默认只记长度/计数 |
+| `AUDIT_ALLOW` | 置 1 时审计记录自动放行决策；默认只记拦截与人工决策 |
 
 ## 架构
 
 ### 分层视角
 
 项目沿通用 agent 分层视角（L1 推理 → L6 界面）自内向外推进：先打牢推理与上下文
-底座，再向上补动作（工具/路由）与观测（trace），界面保持最简 CLI。当前实现覆盖
-L1–L3 主体与 L5 的 Trace 底座，完整形态见下图：
+底座，再向上补动作（工具/路由）与观测（Trace / 审计 / 审批 / Eval），界面保持最简
+CLI。当前实现覆盖 L1–L3 主体与 L5 的完整观测链路，完整形态见下图：
 
 ![agent 分层参考](docs/structure.png)
 
@@ -120,8 +126,10 @@ src/
 │   ├── tool-registry.ts     #   工具路由：registry + 暴露过滤 + 执行门控
 │   └── soft-routing.ts      #   search_tools 元工具 + 活跃集差分声明
 ├── session/                 # 持久化：append-only JSONL 底账 + 重放投影
-└── telemetry/               # L5 观测：事件流重建 span / JSONL store / 树视图
+├── telemetry/               # L5 观测：事件流重建 span / JSONL store / 树视图 / 护栏审计
+└── eval/                    # L5 eval：脚本化模型 harness + 基线对比 runner
 tests/                       # 确定性回归测试（npm test）
+evals/                       # eval 用例 + 基线（baseline.json）
 docs/                        # 调研存档（对照 pi / Claude Code / Codex / OTel）
 ```
 
@@ -139,7 +147,9 @@ docs/                        # 调研存档（对照 pi / Claude Code / Codex / 
 
 ```bash
 npm run typecheck   # tsc --noEmit
-npm test            # 7 个测试文件：控制流 / 审查回归 / 路由 / 会话与压缩 / 软路由 / 流式 / trace
+npm test            # 9 个测试文件：控制流 / 审查回归 / 路由 / 会话与压缩 / 软路由 / 流式 / trace / 审计 / 审批
+npm run eval        # 确定性 eval（脚本化模型 + 真实工具 + trace 断言），与基线对比；失败 exit 1
+npm run eval -- --update-baseline   # 更新 eval 基线
 ```
 
 ## 文档

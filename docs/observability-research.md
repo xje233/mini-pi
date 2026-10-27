@@ -355,10 +355,10 @@ npm run eval                # 输出 passed/tokens/turns 表 + 与上次基线�
 
 ## 4. 未决问题（待拍板）
 
-> **2026-10-26 进展（见 DEVLOG F12/F13/F14）**：问题 1、2 已实现——单文件 append
+> **2026-10-26 进展（见 DEVLOG F12–F15）**：问题 1、2 已实现——单文件 append
 > （`.mini-pi/traces/<sessionId>.jsonl`）+ 事件流重建（`src/telemetry/`）；
-> 3 留待 L5-C（先确定性断言）；4 已实现（`tool_decision` + `.mini-pi/audit/` +
-> `/audit` + `ASK_TOOLS` 交互审批，user_* 四态归因）。
+> 3 已实现确定性部分（`npm run eval`，LLM judge 未做）；4 已实现（`tool_decision` +
+> `.mini-pi/audit/` + `/audit` + `ASK_TOOLS` 交互审批，user_* 四态归因）。
 
 1. **trace 存储**：复用一个文件（每 session 一个 JSONL）还是按 trace 分文件？
    建议单文件 append（session 即天然聚合单位），`/trace` 读取时重建树。

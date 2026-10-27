@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "gitCommit": "11408e5",
+  "updatedAt": "2026-10-26T11:14:42.124Z",
+  "cases": [
+    {
+      "name": "01 工具序列（写→读）",
+      "passed": true
+    },
+    {
+      "name": "02 审批拒绝后自愈",
+      "passed": true
+    },
+    {
+      "name": "03 截断保护",
+      "passed": true
+    },
+    {
+      "name": "04 自动压缩",
+      "passed": true
+    },
+    {
+      "name": "05 maxTurns 强制收尾",
+      "passed": true
+    },
+    {
+      "name": "06 审批 always 记忆",
+      "passed": true
+    }
+  ]
+}

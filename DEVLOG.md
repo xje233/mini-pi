@@ -710,3 +710,56 @@ tests/approval.test.mjs    # 6 项断言
 审批 UI 未做"查看完整参数"（argsPreview 截断 200）；L5-C eval 未开始。
 
 ---
+
+## F15 · L5 观测第四步：确定性 Eval（2026-10-26）
+
+**做了什么**
+
+L5 的最后一块：可重复的行为评估。脚本化模型（mock `StreamFn` 回放 turns）+
+真实工具（每个 case 独立 tmpdir）+ trace 断言（直接复用 L5-A 的 span 树）+
+审计断言；6 个用例覆盖工具序列、审批拒绝自愈、审批 always、截断保护、
+自动压缩、迭代上限。基线对比（pass-rate + newly failing），失败 exit 1。
+明确不做 judge（rubric 评分留作可选扩展）。
+
+**代码结构**
+
+```
+src/eval/harness.ts       # EvalCase 类型 + runCase：临时目录/脚本化 streamFn/工具包装/断言
+src/eval/runner.ts        # 用例发现（动态 import）→ 串行执行 → 报告 → 基线（--update-baseline）
+evals/cases/*.eval.mjs    # 6 个用例（声明式：turns + expect + verify）
+evals/baseline.json       # 基线（git commit + 每用例 passed）
+```
+
+**关键设计决策（对照 pi evals / 调研结论）**
+
+1. **确定性优先，不调真实 API**：模型输出由脚本回放，工具用真实实现——零成本、
+   无 flake、可进 CI。这是调研结论"有确定性信号就不要用 judge"的直接落地。
+2. **mock 模型 + 真实工具**：模型是脚本，但 write_file/read_file 真跑（临时目录），
+   `verify` 断言文件状态——评估的是"harness 把模型意图变成系统状态"的完整链路，
+   而不只是消息文本。
+3. **trace 即断言面**：spans/deniedTools/span 序列直接读 L5-A 的收集器——
+   观测层与评估层共用同一数据源，这是前几层投入的复用（pi 的 evals 同样吃
+   session/trace 产物）。
+4. **摘要调用不消耗脚本**：压缩的摘要请求 `tools=[]`，harness 据此回放固定摘要；
+   且必须发 `text_delta`——`compactHistory` 只累加 delta，这是实测踩到的坑
+   （只发 done 会被当成空摘要，压缩静默跳过）。
+5. **基线是"版本"而不是"绝对分数"**：baseline.json 记录 git commit + 每用例
+   passed；报告给出 pass-rate 变化与 newly failing/newly passing。eval 的价值在
+   对比，不在单次分数。
+6. **失败 exit 1**：CI 门禁语义（对照 promptfoo/Braintrust 的 PR 门禁实践），
+   但当前不阻塞开发流程（`npm test` 仍是主回归）。
+7. **不做 judge**：需要语义评分时再加 rubric grader，且默认只报告不阻断
+   （pi 的 `judgeThreshold: null` 同款）；当前 6 个用例全部是确定性断言。
+
+**验证**
+
+- `npm test` 54 项全绿；`npm run eval` 6/6（100%），typecheck 通过。
+- 门禁实测：故意改坏 01 的 finalText → 5/6、报告"新失败: 01…"、退出码 1；
+  恢复后 6/6、退出码 0。
+- 基线对比实测：更新基线后二次运行显示 `6/6 → 6/6（+0 个百分点）`。
+
+**未尽事项**：LLM judge（可选，未做）；eval 未接入 CI（仓库暂无 CI 配置）；
+用例集只有 6 个（可扩展真实模型的 smoke eval——需要 API Key，默认不跑）；
+基线不区分模型/prompt 版本（当前是脚本化模型，无此需求）。
+
+---
